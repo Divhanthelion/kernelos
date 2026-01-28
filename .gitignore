@@ -1,0 +1,49 @@
+# === Claude / AI ===
+.claude/
+context_prompt.txt
+*_context.txt
+*_codebase.txt
+tmpclaude-*
+
+# === OS ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === IDE ===
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# === Temp / Logs ===
+*.tmp
+*.temp
+*.log
+
+# === Environment / Secrets ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+*.keystore
+*.jks
+
+# === Markdown (except README) ===
+*.md
+!README.md
+
+# === Text files (except requirements) ===
+*.txt
+!requirements.txt
+!requirements-dev.txt
+
+# === Rust ===
+target/
+**/*.rs.bk
+

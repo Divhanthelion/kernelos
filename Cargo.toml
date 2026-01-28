@@ -1,0 +1,53 @@
+[package]
+name = "kernelosv2"
+version = "0.2.0"
+edition = "2021"
+description = "A WebAssembly-based desktop environment"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yew = { version = "0.21", features = ["csr"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "MouseEvent",
+    "KeyboardEvent",
+    "InputEvent",
+    "Event",
+    "EventTarget",
+    "Storage",
+    "CssStyleDeclaration",
+    "DomRect",
+    "Node",
+    "NodeList",
+    "Touch",
+    "TouchEvent",
+    "TouchList",
+    "AudioContext",
+    "OscillatorNode",
+    "OscillatorType",
+    "GainNode",
+    "AudioDestinationNode",
+] }
+js-sys = "0.3"
+wasm-logger = "0.2"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+gloo-timers = "0.3"
+gloo-events = "0.2"
+rand = { version = "0.8", features = ["small_rng"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
