@@ -29,8 +29,7 @@ use base64::Engine as _;
 
 use crate::filesystem::{FileSystem, FileType};
 use crate::plugin::abi::{
-    decode_ui_ops, encode_event, Capability, Event, Grant, PermissionsStore, PluginManifest, UiOp,
-    ABI_VERSION,
+    decode_ui_ops, encode_event, Event, Grant, PermissionsStore, PluginManifest, UiOp, ABI_VERSION,
 };
 use crate::plugin::imports::{build_imports, fill_shared, InstanceShared};
 use crate::plugin::memory::{call_i32, call_void, GuestMemory};
@@ -289,7 +288,14 @@ impl PluginRegistry {
                 log::warn!("plugin {id}: corrupt wasm payload, skipping");
                 continue;
             };
-            let grant = grant_for(&fs, &id, &manifest.requests);
+            // Consent is required: never fabricate a grant here. Bundled plugins
+            // write their grant at first-boot install; everything else must have
+            // been confirmed via `pkg install`. No stored grant → treat as not
+            // installed rather than silently granting.
+            let Some(grant) = stored_grant(&fs, &id) else {
+                log::warn!("plugin {id}: no stored grant, skipping (reinstall to consent)");
+                continue;
+            };
             self.apps.push(PluginApp {
                 manifest,
                 bytes,
@@ -332,8 +338,18 @@ pub fn init(
             }
             let manifest_url = format!("/plugins/{id}.json");
             let wasm_url = format!("/plugins/{id}.wasm");
-            match install_from_url(&fs, &manifest_url, &wasm_url, notify).await {
-                Ok(()) => changed.emit(()),
+            // Bundled plugins ship with the OS. plugin::init runs before any
+            // Terminal exists, so there is no user to prompt — auto-grant the
+            // manifest's requested capabilities. This carve-out is deliberate;
+            // interactive installs must go through consent in `pkg install`.
+            match fetch_plugin_manifest(&manifest_url).await {
+                Ok(manifest) => {
+                    let grant = Grant(manifest.requests.clone());
+                    match complete_install(&fs, manifest, &wasm_url, grant, notify).await {
+                        Ok(()) => changed.emit(()),
+                        Err(e) => log::warn!("bundled plugin '{id}' not loaded: {e}"),
+                    }
+                }
                 Err(e) => log::warn!("bundled plugin '{id}' not loaded: {e}"),
             }
         });
@@ -397,14 +413,8 @@ pub fn instantiate(
     instantiate_bytes(&app.manifest, &app.grant, &app.bytes, fs, on_notify)
 }
 
-/// Fetch a manifest + wasm pair, verify it, persist it to the VFS and register
-/// it. This is the M8 install path (`pkg install` and bundled-plugin seeding).
-pub async fn install_from_url(
-    fs: &Rc<RefCell<FileSystem>>,
-    manifest_url: &str,
-    wasm_url: &str,
-    on_notify: Callback<(String, String)>,
-) -> Result<(), String> {
+/// Fetch and validate a plugin manifest (ABI check included). Does not install.
+pub async fn fetch_plugin_manifest(manifest_url: &str) -> Result<PluginManifest, String> {
     let manifest_json = fetch_text(manifest_url).await?;
     let manifest: PluginManifest =
         serde_json::from_str(&manifest_json).map_err(|e| format!("bad manifest: {e}"))?;
@@ -414,7 +424,21 @@ pub async fn install_from_url(
             manifest.abi_version
         ));
     }
+    Ok(manifest)
+}
 
+/// Complete an install given an already-fetched manifest and an explicit Grant
+/// the caller has consented to (or auto-granted for bundled plugins).
+///
+/// Fetches wasm, verifies `wasm_hash` when present, probes link/instantiate,
+/// persists the grant, then registers the plugin.
+pub async fn complete_install(
+    fs: &Rc<RefCell<FileSystem>>,
+    manifest: PluginManifest,
+    wasm_url: &str,
+    grant: Grant,
+    on_notify: Callback<(String, String)>,
+) -> Result<(), String> {
     let bytes = fetch_bytes(wasm_url).await?;
 
     // Content-hash pinning when the manifest names the exact authorised bytes.
@@ -425,13 +449,17 @@ pub async fn install_from_url(
         }
     }
 
-    // Verify the module actually compiles and links before persisting it, so a
-    // bad plugin fails the install instead of failing at launch.
-    let probe = instantiate_bytes(&manifest, &Grant(manifest.requests.clone()), &bytes, fs, on_notify.clone())
+    // Verify the module actually compiles and links under this grant before
+    // persisting anything, so a bad plugin fails the install instead of failing
+    // at launch.
+    let probe = instantiate_bytes(&manifest, &grant, &bytes, fs, on_notify.clone())
         .map_err(|e| format!("load check failed: {e}"))?;
     drop(probe);
 
-    register(fs, manifest, bytes, on_notify)?;
+    // Persist consent only after the probe succeeds.
+    save_grant(fs, &manifest.id, &grant);
+
+    register(fs, manifest, bytes, grant, on_notify)?;
     Ok(())
 }
 
@@ -531,6 +559,7 @@ fn register(
     fs: &Rc<RefCell<FileSystem>>,
     manifest: PluginManifest,
     bytes: Vec<u8>,
+    grant: Grant,
     on_notify: Callback<(String, String)>,
 ) -> Result<(), String> {
     let id = manifest.id.clone();
@@ -558,9 +587,6 @@ fn register(
         fs.write_file(&wasm_path, &b64)?;
     }
 
-    // Record the grant (all-or-nothing for v1 — see plan §5).
-    let grant = grant_for(fs, &id, &manifest.requests);
-
     REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
         if reg.apps.iter().any(|a| a.manifest.id == id) {
@@ -576,15 +602,15 @@ fn register(
     })
 }
 
-fn grant_for(fs: &Rc<RefCell<FileSystem>>, id: &str, requests: &[Capability]) -> Grant {
+/// Look up a previously consented grant. Never fabricates one.
+pub(crate) fn stored_grant(fs: &Rc<RefCell<FileSystem>>, id: &str) -> Option<Grant> {
+    load_permissions(fs).grants.get(id).cloned()
+}
+
+fn save_grant(fs: &Rc<RefCell<FileSystem>>, id: &str, grant: &Grant) {
     let mut store = load_permissions(fs);
-    if let Some(grant) = store.grants.get(id) {
-        return grant.clone();
-    }
-    let grant = Grant(requests.to_vec());
     store.grants.insert(id.to_string(), grant.clone());
     save_permissions(fs, &store);
-    grant
 }
 
 fn load_permissions(fs: &Rc<RefCell<FileSystem>>) -> PermissionsStore {
@@ -648,7 +674,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_pages, WASM_PAGE_SIZE};
+    use super::{check_pages, stored_grant, WASM_PAGE_SIZE};
+    use crate::filesystem::FileSystem;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn memory_cap_allows_at_limit() {
@@ -660,5 +689,13 @@ mod tests {
     fn memory_cap_rejects_over_limit() {
         let err = check_pages(257 * WASM_PAGE_SIZE, 256).unwrap_err();
         assert_eq!(err, "memory limit exceeded (257 > 256 pages)");
+    }
+
+    #[test]
+    fn stored_grant_returns_none_for_unknown_plugin() {
+        // Empty default FS → load_permissions falls back to an empty store.
+        // stored_grant must not invent a grant for an unknown id.
+        let fs = Rc::new(RefCell::new(FileSystem::default()));
+        assert!(stored_grant(&fs, "unknown-plugin").is_none());
     }
 }

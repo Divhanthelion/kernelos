@@ -3,7 +3,16 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 use crate::filesystem::{FileSystem, FileType};
+use crate::plugin::abi::{describe_capability, Grant, PluginManifest};
 use std::path::Path;
+
+/// Stashed after `pkg install` fetches a manifest; the next line is y/N.
+struct PendingInstall {
+    manifest: PluginManifest,
+    wasm_url: String,
+    /// Original install spec, for status messages.
+    spec: String,
+}
 
 pub struct Terminal {
     fs: Rc<RefCell<FileSystem>>,
@@ -17,6 +26,7 @@ pub struct Terminal {
     input_ref: NodeRef,
     username: String,
     hostname: String,
+    pending_install: Option<PendingInstall>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -35,6 +45,12 @@ pub enum TerminalMsg {
     /// Async command result (e.g. `pkg install`) appended to the output.
     Output(String),
     Error(String),
+    /// Manifest fetched; show capability list and wait for y/N.
+    InstallPrompt {
+        manifest: PluginManifest,
+        wasm_url: String,
+        spec: String,
+    },
 }
 
 #[derive(Properties, Clone, PartialEq)]
@@ -60,6 +76,7 @@ impl Component for Terminal {
             input_ref: NodeRef::default(),
             username: "user".to_string(),
             hostname: "kernelosv2".to_string(),
+            pending_install: None,
         };
         
         terminal.output_lines.push(TerminalLine::Output(
@@ -82,7 +99,11 @@ impl Component for Terminal {
             TerminalMsg::ExecuteCommand => {
                 let command = self.current_input.trim().to_string();
                 if !command.is_empty() {
-                    self.execute_command(&command, ctx);
+                    if self.pending_install.is_some() {
+                        self.handle_install_confirm(&command, ctx);
+                    } else {
+                        self.execute_command(&command, ctx);
+                    }
                     self.current_input.clear();
                     self.history_index = None;
                 }
@@ -145,6 +166,35 @@ impl Component for Terminal {
             }
             TerminalMsg::Error(text) => {
                 self.output_lines.push(TerminalLine::Error(text));
+                true
+            }
+            TerminalMsg::InstallPrompt {
+                manifest,
+                wasm_url,
+                spec,
+            } => {
+                self.output_lines.push(TerminalLine::Output(format!(
+                    "{} ({}) requests:",
+                    manifest.name, manifest.id
+                )));
+                if manifest.requests.is_empty() {
+                    self.output_lines
+                        .push(TerminalLine::Output("  (none)".to_string()));
+                } else {
+                    for cap in &manifest.requests {
+                        self.output_lines.push(TerminalLine::Output(format!(
+                            "  - {}",
+                            describe_capability(cap)
+                        )));
+                    }
+                }
+                self.output_lines
+                    .push(TerminalLine::Output("Install? [y/N]".to_string()));
+                self.pending_install = Some(PendingInstall {
+                    manifest,
+                    wasm_url,
+                    spec,
+                });
                 true
             }
         }
@@ -305,8 +355,8 @@ impl Terminal {
     }
 
     /// Plugin package manager: `pkg install <id|url>`, `pkg list`, `pkg remove <id>`.
-    /// Install fetches the manifest + wasm, verifies them, stores them in the
-    /// VFS and registers the plugin (plan M8).
+    /// Install is two-phase: fetch manifest → prompt for capability consent →
+    /// on `y` complete the install with an explicit Grant.
     fn cmd_pkg(&mut self, parts: &[&str], ctx: &Context<Self>) {
         match parts.get(1).copied().unwrap_or("") {
             "install" => {
@@ -316,18 +366,17 @@ impl Terminal {
                     ));
                     return;
                 };
+                if self.pending_install.is_some() {
+                    self.output_lines.push(TerminalLine::Error(
+                        "finish or cancel the pending install first (y/N)".to_string(),
+                    ));
+                    return;
+                }
                 let spec = spec.to_string();
                 self.output_lines.push(TerminalLine::Output(format!(
-                    "Installing '{spec}'..."
+                    "Fetching '{spec}'..."
                 )));
 
-                let fs = Rc::clone(&self.fs);
-                let on_notify = {
-                    let cb = ctx.props().on_notification.clone();
-                    Callback::from(move |(title, body): (String, String)| {
-                        cb.emit((title, body, "info".to_string()));
-                    })
-                };
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let (manifest_url, wasm_url) = if spec.contains("://") {
@@ -339,17 +388,12 @@ impl Terminal {
                             format!("/plugins/{spec}.wasm"),
                         )
                     };
-                    match crate::plugin::install_from_url(
-                        &fs,
-                        &manifest_url,
-                        &wasm_url,
-                        on_notify,
-                    )
-                    .await
-                    {
-                        Ok(()) => link.send_message(TerminalMsg::Output(format!(
-                            "Installed '{spec}'."
-                        ))),
+                    match crate::plugin::fetch_plugin_manifest(&manifest_url).await {
+                        Ok(manifest) => link.send_message(TerminalMsg::InstallPrompt {
+                            manifest,
+                            wasm_url,
+                            spec,
+                        }),
                         Err(e) => link.send_message(TerminalMsg::Error(format!(
                             "pkg install: {e}"
                         ))),
@@ -392,6 +436,63 @@ impl Terminal {
                 ));
             }
         }
+    }
+
+    /// Interpret the next line as the y/N answer for a pending `pkg install`.
+    fn handle_install_confirm(&mut self, answer: &str, ctx: &Context<Self>) {
+        let prompt = self.get_prompt();
+        self.output_lines.push(TerminalLine::Command {
+            prompt,
+            command: answer.to_string(),
+        });
+
+        let pending = match self.pending_install.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let confirmed = matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes");
+        if !confirmed {
+            self.output_lines.push(TerminalLine::Output(format!(
+                "Cancelled install of '{}'.",
+                pending.spec
+            )));
+            return;
+        }
+
+        self.output_lines.push(TerminalLine::Output(format!(
+            "Installing '{}'...",
+            pending.spec
+        )));
+
+        let fs = Rc::clone(&self.fs);
+        let on_notify = {
+            let cb = ctx.props().on_notification.clone();
+            Callback::from(move |(title, body): (String, String)| {
+                cb.emit((title, body, "info".to_string()));
+            })
+        };
+        let link = ctx.link().clone();
+        let grant = Grant(pending.manifest.requests.clone());
+        let spec = pending.spec.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::plugin::complete_install(
+                &fs,
+                pending.manifest,
+                &pending.wasm_url,
+                grant,
+                on_notify,
+            )
+            .await
+            {
+                Ok(()) => link.send_message(TerminalMsg::Output(format!(
+                    "Installed '{spec}'."
+                ))),
+                Err(e) => link.send_message(TerminalMsg::Error(format!(
+                    "pkg install: {e}"
+                ))),
+            }
+        });
     }
 
     fn cmd_help(&mut self) {

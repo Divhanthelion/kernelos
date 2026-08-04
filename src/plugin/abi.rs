@@ -136,6 +136,17 @@ impl Grant {
     }
 }
 
+/// Human-readable capability line for consent prompts (not Debug).
+pub fn describe_capability(cap: &Capability) -> String {
+    match cap {
+        Capability::VfsRead { prefix } => format!("read files under {prefix}"),
+        Capability::VfsWrite { prefix } => format!("write files under {prefix}"),
+        Capability::Notify => "show notifications".into(),
+        Capability::Clipboard => "access the clipboard".into(),
+        Capability::Persist => "persist data across reloads".into(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PermissionsStore {
     #[serde(default)]
@@ -187,5 +198,30 @@ mod tests {
         }"#;
         let m: PluginManifest = serde_json::from_str(raw).unwrap();
         assert_eq!(m.max_pages, 256);
+    }
+
+    #[test]
+    fn describe_capability_includes_vfs_prefix() {
+        let cap = Capability::VfsRead {
+            prefix: "/home/documents".into(),
+        };
+        let text = describe_capability(&cap);
+        assert!(text.contains("/home/documents"), "got: {text}");
+        assert!(!text.contains("VfsRead"), "must not use Debug form: {text}");
+    }
+
+    #[test]
+    fn permissions_store_round_trips() {
+        let mut store = PermissionsStore::default();
+        store.grants.insert(
+            "hello".into(),
+            Grant(vec![Capability::Notify]),
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        let back: PermissionsStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.grants.get("hello"),
+            Some(&Grant(vec![Capability::Notify]))
+        );
     }
 }
