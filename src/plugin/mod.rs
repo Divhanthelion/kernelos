@@ -5,18 +5,19 @@
 //! - **Command channel** — the guest pushes side-effecting requests through
 //!   host imports it calls during `update`.
 //!
-//! Loading is asynchronous only where it has to be (fetching bytes over HTTP).
+//! Loading is asynchronous where persistence or network access requires it.
 //! Instantiation is synchronous (`WebAssembly.Module` / `WebAssembly.Instance`
 //! constructors are sync in js_sys), so opening a window for an installed
-//! plugin, and every `update`/`render` call, happen on the Yew event loop with
-//! no futures involved.
+//! plugin, and every `update`/`render` call, happen on the Yew event loop.
 
 pub mod abi;
 pub mod imports;
 pub mod memory;
 pub mod render;
+pub mod wasm_store;
 
 use std::cell::RefCell;
+use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 
 use js_sys::{Function, Reflect, Uint8Array, WebAssembly};
@@ -36,13 +37,16 @@ use crate::plugin::memory::{call_i32, call_void, GuestMemory};
 
 pub const PERMISSIONS_PATH: &str = "/system/config/permissions.json";
 pub const APPLICATIONS_DIR: &str = "/applications";
+const DISABLED_BUNDLED_PLUGINS_PATH: &str = "/system/config/disabled_bundled_plugins.json";
 
-/// Plugins shipped with the OS, fetched from the static server on first run
-/// and then persisted into the VFS like any installed plugin.
+/// Plugins shipped with the OS, fetched from the static server when absent
+/// unless the user has explicitly removed them.
 const BUNDLED_PLUGINS: &[&str] = &["hello"];
 
 /// WASM page size in bytes. Guest memory is always a multiple of this.
 pub(crate) const WASM_PAGE_SIZE: u32 = 65536;
+/// Host-wide ceiling; plugin manifests may request less, never more.
+pub(crate) const MAX_PLUGIN_PAGES: u32 = 256;
 
 /// Return `Ok(())` if `byte_length` fits in `max_pages`, else an error naming
 /// both the observed and capped page counts (for the crash-card message).
@@ -55,6 +59,34 @@ pub(crate) fn check_pages(byte_length: u32, max_pages: u32) -> Result<(), String
     } else {
         Ok(())
     }
+}
+
+fn validate_plugin_id(id: &str) -> Result<(), String> {
+    let id = id.as_bytes();
+    let valid_id = !id.is_empty()
+        && id.len() <= 64
+        && id.first().is_some_and(u8::is_ascii_alphanumeric)
+        && id.last().is_some_and(u8::is_ascii_alphanumeric)
+        && id
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+    if !valid_id {
+        return Err(
+            "plugin id must be a lowercase alphanumeric slug with optional hyphens".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_manifest_limits(manifest: &PluginManifest) -> Result<(), String> {
+    validate_plugin_id(&manifest.id)?;
+    if manifest.max_pages == 0 || manifest.max_pages > MAX_PLUGIN_PAGES {
+        return Err(format!(
+            "manifest max_pages {} is outside the host range 1..={MAX_PLUGIN_PAGES}",
+            manifest.max_pages
+        ));
+    }
+    Ok(())
 }
 
 // ── Per-window instance ──────────────────────────────────────────────────────
@@ -238,6 +270,8 @@ struct PluginRegistry {
     fs: Option<Rc<RefCell<FileSystem>>>,
     on_notify: Option<Callback<(String, String)>>,
     apps: Vec<PluginApp>,
+    installing: HashSet<String>,
+    hydrated: bool,
 }
 
 impl PluginRegistry {
@@ -246,95 +280,262 @@ impl PluginRegistry {
             fs: None,
             on_notify: None,
             apps: Vec::new(),
+            installing: HashSet::new(),
+            hydrated: false,
         }
     }
+}
 
-    /// Synchronously load plugins persisted in the VFS (`/applications`).
-    /// Runs at desktop startup, before any window is created, so restored
-    /// plugin windows can re-instantiate without waiting on the network.
-    fn load_installed(&mut self) {
-        let Some(fs) = self.fs.clone() else {
-            return;
+/// Load installed manifests from the VFS and their raw modules from IndexedDB.
+/// The registry is populated only after all asynchronous reads complete.
+async fn load_installed(fs: &Rc<RefCell<FileSystem>>) -> Vec<PluginApp> {
+    let Ok(entries) = fs.borrow().list_directory(APPLICATIONS_DIR) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        if entry.file_type != FileType::File || !entry.name.ends_with(".json") {
+            continue;
+        }
+        let id = entry.name.trim_end_matches(".json").to_string();
+        let manifest_path = format!("{APPLICATIONS_DIR}/{id}.json");
+        let Ok(raw) = fs.borrow().read_file(&manifest_path) else {
+            continue;
         };
-        let Ok(entries) = fs.borrow().list_directory(APPLICATIONS_DIR) else {
-            return;
+        let Ok(manifest) = serde_json::from_str::<PluginManifest>(&raw) else {
+            log::warn!("plugin {id}: unparseable manifest, skipping");
+            continue;
         };
-        for entry in entries {
-            if entry.file_type != FileType::File || !entry.name.ends_with(".json") {
-                continue;
-            }
-            let id = entry.name.trim_end_matches(".json").to_string();
-            let manifest_path = format!("{APPLICATIONS_DIR}/{id}.json");
-            let Ok(raw) = fs.borrow().read_file(&manifest_path) else {
-                continue;
-            };
-            let Ok(manifest) = serde_json::from_str::<PluginManifest>(&raw) else {
-                log::warn!("plugin {id}: unparseable manifest, skipping");
-                continue;
-            };
-            if manifest.abi_version != ABI_VERSION {
-                log::warn!(
-                    "plugin {id}: ABI version {} unsupported (host is {ABI_VERSION}), skipping",
-                    manifest.abi_version
-                );
-                continue;
-            }
-            let wasm_path = format!("{APPLICATIONS_DIR}/{id}.wasm.b64");
-            let Ok(b64) = fs.borrow().read_file(&wasm_path) else {
-                log::warn!("plugin {id}: missing wasm payload, skipping");
-                continue;
-            };
-            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
-                log::warn!("plugin {id}: corrupt wasm payload, skipping");
-                continue;
-            };
-            // Consent is required: never fabricate a grant here. Bundled plugins
-            // write their grant at first-boot install; everything else must have
-            // been confirmed via `pkg install`. No stored grant → treat as not
-            // installed rather than silently granting.
-            let Some(grant) = stored_grant(&fs, &id) else {
-                log::warn!("plugin {id}: no stored grant, skipping (reinstall to consent)");
-                continue;
-            };
-            self.apps.push(PluginApp {
+        if manifest.abi_version != ABI_VERSION {
+            log::warn!(
+                "plugin {id}: ABI version {} unsupported (host is {ABI_VERSION}), skipping",
+                manifest.abi_version
+            );
+            continue;
+        }
+        if let Err(e) = validate_manifest_limits(&manifest) {
+            log::warn!("plugin {id}: {e}, skipping");
+            continue;
+        }
+
+        // Consent is required: never fabricate a grant here. Bundled plugins
+        // write their grant at first-boot install; everything else must have
+        // been confirmed via `pkg install`.
+        let Some(grant) = stored_grant(fs, &id) else {
+            log::warn!("plugin {id}: no stored grant, skipping (reinstall to consent)");
+            continue;
+        };
+        candidates.push((id, manifest, grant));
+    }
+
+    let mut apps = Vec::new();
+    for (id, manifest, grant) in candidates {
+        match load_wasm_bytes(fs, &id, manifest.max_pages).await {
+            Ok(bytes) => apps.push(PluginApp {
                 manifest,
                 bytes,
                 grant,
-            });
+            }),
+            Err(e) => log::warn!("plugin {id}: {e}, skipping"),
         }
     }
+    apps
+}
+
+/// Read raw bytes from IndexedDB, migrating one legacy base64 VFS payload on
+/// first use. The old VFS file is removed only after the IndexedDB write lands.
+async fn load_wasm_bytes(
+    fs: &Rc<RefCell<FileSystem>>,
+    id: &str,
+    max_pages: u32,
+) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = wasm_store::get(id).await? {
+        validate_memory_limit(&bytes, max_pages)?;
+        return Ok(bytes);
+    }
+
+    let legacy_path = format!("{APPLICATIONS_DIR}/{id}.wasm.b64");
+    let encoded = fs
+        .borrow()
+        .read_file(&legacy_path)
+        .map_err(|_| "missing wasm payload".to_string())?;
+    let bytes = decode_legacy_wasm(&encoded)?;
+    validate_memory_limit(&bytes, max_pages)?;
+    wasm_store::put(id, &bytes).await?;
+
+    if let Err(e) = fs.borrow_mut().delete(&legacy_path, false) {
+        log::warn!("plugin {id}: migrated bytes but could not remove legacy payload: {e}");
+    }
+    Ok(bytes)
+}
+
+fn decode_legacy_wasm(encoded: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| "corrupt legacy wasm payload".to_string())
+}
+
+/// Require one defined 32-bit memory with an explicit maximum no greater than
+/// the manifest cap. This closes the gap where a guest can grow without bound
+/// inside one call before the host's post-call soft check runs.
+fn validate_memory_limit(bytes: &[u8], max_pages: u32) -> Result<(), String> {
+    const WASM_HEADER: &[u8; 8] = b"\0asm\x01\0\0\0";
+    if bytes.get(..WASM_HEADER.len()) != Some(WASM_HEADER) {
+        return Err("invalid WebAssembly header".to_string());
+    }
+
+    let mut cursor = WASM_HEADER.len();
+    let mut memory_count = 0_u32;
+    while cursor < bytes.len() {
+        let section_id = *bytes
+            .get(cursor)
+            .ok_or_else(|| "truncated WebAssembly section".to_string())?;
+        cursor += 1;
+        let section_size = read_uleb(bytes, &mut cursor)?;
+        let section_size = usize::try_from(section_size)
+            .map_err(|_| "WebAssembly section is too large".to_string())?;
+        let section_end = cursor
+            .checked_add(section_size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "truncated WebAssembly section".to_string())?;
+
+        if section_id == 5 {
+            let mut memory_cursor = cursor;
+            let count = read_uleb(bytes, &mut memory_cursor)?;
+            for _ in 0..count {
+                memory_count = memory_count
+                    .checked_add(1)
+                    .ok_or_else(|| "too many WebAssembly memories".to_string())?;
+                let flags = read_uleb(bytes, &mut memory_cursor)?;
+                if flags & !0x03 != 0 {
+                    return Err("64-bit or unsupported WebAssembly memory".to_string());
+                }
+                let initial = read_uleb(bytes, &mut memory_cursor)?;
+                if flags & 0x01 == 0 {
+                    return Err("plugin memory has no hard maximum".to_string());
+                }
+                let maximum = read_uleb(bytes, &mut memory_cursor)?;
+                if initial > maximum {
+                    return Err("plugin memory minimum exceeds its maximum".to_string());
+                }
+                if maximum > u64::from(max_pages) {
+                    return Err(format!(
+                        "plugin memory maximum {maximum} exceeds manifest cap {max_pages}"
+                    ));
+                }
+            }
+            if memory_cursor != section_end {
+                return Err("malformed WebAssembly memory section".to_string());
+            }
+        }
+        cursor = section_end;
+    }
+
+    match memory_count {
+        1 => Ok(()),
+        0 => Err("plugin must define one bounded linear memory".to_string()),
+        count => Err(format!("plugin defines {count} linear memories; expected one")),
+    }
+}
+
+fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let mut value = 0_u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| "truncated WebAssembly integer".to_string())?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return Err("WebAssembly integer overflow".to_string());
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("WebAssembly integer overflow".to_string())
 }
 
 thread_local! {
     static REGISTRY: RefCell<PluginRegistry> = RefCell::new(PluginRegistry::empty());
 }
 
+struct InstallReservation {
+    id: String,
+}
+
+impl Drop for InstallReservation {
+    fn drop(&mut self) {
+        REGISTRY.with(|r| {
+            r.borrow_mut().installing.remove(&self.id);
+        });
+    }
+}
+
+fn reserve_install(id: &str) -> Result<InstallReservation, String> {
+    REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        if reg.apps.iter().any(|app| app.manifest.id == id) {
+            return Err(format!("plugin '{id}' is already installed"));
+        }
+        if !reg.installing.insert(id.to_string()) {
+            return Err(format!("plugin '{id}' is already installing"));
+        }
+        Ok(InstallReservation { id: id.to_string() })
+    })
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Initialise the registry: load installed plugins synchronously, then fetch
-/// bundled plugins in the background. Idempotent per page load.
+/// Initialise the registry from IndexedDB, then fetch missing bundled plugins.
+/// `on_ready` fires after persisted plugins are available for session restore.
+/// Idempotent per page load.
 pub fn init(
     fs: Rc<RefCell<FileSystem>>,
     on_notify: Callback<(String, String)>,
     on_changed: Callback<()>,
+    on_ready: Callback<()>,
 ) {
-    REGISTRY.with(|r| {
+    let should_init = REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
         if reg.fs.is_none() {
             reg.fs = Some(fs.clone());
             reg.on_notify = Some(on_notify.clone());
-            reg.load_installed();
+            true
+        } else {
+            false
         }
     });
 
-    for id in BUNDLED_PLUGINS {
-        let fs = Rc::clone(&fs);
-        let notify = on_notify.clone();
-        let changed = on_changed.clone();
-        let id = id.to_string();
-        spawn_local(async move {
-            if is_installed(&id) {
-                return;
+    if !should_init {
+        on_ready.emit(());
+        return;
+    }
+
+    spawn_local(async move {
+        let installed = load_installed(&fs).await;
+        REGISTRY.with(|r| {
+            let mut reg = r.borrow_mut();
+            for app in installed {
+                let id = &app.manifest.id;
+                if !reg.installing.contains(id)
+                    && !reg
+                        .apps
+                        .iter()
+                        .any(|current| current.manifest.id == id.as_str())
+                {
+                    reg.apps.push(app);
+                }
+            }
+            reg.hydrated = true;
+        });
+
+        let disabled_bundled = load_disabled_bundled_plugins(&fs);
+        for id in BUNDLED_PLUGINS {
+            let id = id.to_string();
+            if is_installed(&id) || disabled_bundled.contains(&id) {
+                continue;
             }
             let manifest_url = format!("/plugins/{id}.json");
             let wasm_url = format!("/plugins/{id}.wasm");
@@ -345,15 +546,24 @@ pub fn init(
             match fetch_plugin_manifest(&manifest_url).await {
                 Ok(manifest) => {
                     let grant = Grant(manifest.requests.clone());
-                    match complete_install(&fs, manifest, &wasm_url, grant, notify).await {
-                        Ok(()) => changed.emit(()),
+                    match complete_install(
+                        &fs,
+                        manifest,
+                        &wasm_url,
+                        grant,
+                        on_notify.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => on_changed.emit(()),
                         Err(e) => log::warn!("bundled plugin '{id}' not loaded: {e}"),
                     }
                 }
                 Err(e) => log::warn!("bundled plugin '{id}' not loaded: {e}"),
             }
-        });
-    }
+        }
+        on_ready.emit(());
+    });
 }
 
 pub fn apps() -> Vec<PluginAppInfo> {
@@ -424,6 +634,7 @@ pub async fn fetch_plugin_manifest(manifest_url: &str) -> Result<PluginManifest,
             manifest.abi_version
         ));
     }
+    validate_manifest_limits(&manifest)?;
     Ok(manifest)
 }
 
@@ -439,6 +650,14 @@ pub async fn complete_install(
     grant: Grant,
     on_notify: Callback<(String, String)>,
 ) -> Result<(), String> {
+    let hydrated = REGISTRY.with(|r| r.borrow().hydrated);
+    if !hydrated {
+        return Err("plugin registry is still loading; retry shortly".to_string());
+    }
+    validate_manifest_limits(&manifest)?;
+    // Reserve before the network fetch so remove/install operations cannot
+    // cross and make a successfully removed plugin reappear.
+    let _reservation = reserve_install(&manifest.id)?;
     let bytes = fetch_bytes(wasm_url).await?;
 
     // Content-hash pinning when the manifest names the exact authorised bytes.
@@ -448,6 +667,7 @@ pub async fn complete_install(
             return Err(format!("wasm hash mismatch: expected {expected}, got {actual}"));
         }
     }
+    validate_memory_limit(&bytes, manifest.max_pages)?;
 
     // Verify the module actually compiles and links under this grant before
     // persisting anything, so a bad plugin fails the install instead of failing
@@ -456,35 +676,57 @@ pub async fn complete_install(
         .map_err(|e| format!("load check failed: {e}"))?;
     drop(probe);
 
-    // Persist consent only after the probe succeeds.
-    save_grant(fs, &manifest.id, &grant);
-
-    register(fs, manifest, bytes, grant, on_notify)?;
+    register_reserved(fs, manifest, bytes, grant).await?;
     Ok(())
 }
 
-pub fn uninstall(id: &str, fs: &Rc<RefCell<FileSystem>>) -> Result<(), String> {
-    REGISTRY.with(|r| -> Result<(), String> {
-        let mut reg = r.borrow_mut();
-        let pos = reg
-            .apps
-            .iter()
-            .position(|a| a.manifest.id == id)
-            .ok_or_else(|| format!("plugin '{id}' is not installed"))?;
-        reg.apps.remove(pos);
-        Ok(())
-    })?;
+pub async fn uninstall(id: &str, fs: &Rc<RefCell<FileSystem>>) -> Result<(), String> {
+    validate_plugin_id(id)?;
+    let (hydrated, install_in_progress) = REGISTRY.with(|r| {
+        let reg = r.borrow();
+        (reg.hydrated, reg.installing.contains(id))
+    });
+    if !hydrated {
+        return Err("plugin registry is still loading; retry shortly".to_string());
+    }
+    if install_in_progress {
+        return Err(format!("plugin '{id}' is still installing"));
+    }
+
+    // Record the user's intent before deleting a bundled payload. If a later
+    // cleanup step is interrupted, an installed manifest still wins on reload;
+    // once cleanup completes, startup will not silently reinstall the plugin.
+    if BUNDLED_PLUGINS.contains(&id) {
+        set_bundled_plugin_disabled(fs, id, true)?;
+    }
+
+    // Remove the durable payload first. IndexedDB delete is idempotent, so a
+    // retry remains safe if a later localStorage cleanup is interrupted.
+    wasm_store::delete(id).await?;
 
     {
-        let mut fs = fs.borrow_mut();
-        let _ = fs.delete(&format!("{APPLICATIONS_DIR}/{id}.json"), false);
-        let _ = fs.delete(&format!("{APPLICATIONS_DIR}/{id}.wasm.b64"), false);
+        let mut filesystem = fs.borrow_mut();
+        let paths = [
+            format!("{APPLICATIONS_DIR}/{id}.json"),
+            format!("{APPLICATIONS_DIR}/{id}.wasm.b64"),
+            format!("/system/config/plugin_{id}.json"),
+        ];
+        for path in paths {
+            if filesystem.exists(&path) {
+                filesystem.delete(&path, false)?;
+            }
+        }
     }
 
     // Drop the stored grant too, so a reinstall re-prompts (all-or-nothing).
     let mut store = load_permissions(fs);
-    store.grants.remove(id);
-    save_permissions(fs, &store);
+    if store.grants.remove(id).is_some() {
+        save_permissions(fs, &store)?;
+    }
+
+    REGISTRY.with(|r| {
+        r.borrow_mut().apps.retain(|app| app.manifest.id != id);
+    });
 
     Ok(())
 }
@@ -555,51 +797,69 @@ fn instantiate_bytes(
     Ok(handle)
 }
 
-fn register(
+async fn register_reserved(
     fs: &Rc<RefCell<FileSystem>>,
     manifest: PluginManifest,
     bytes: Vec<u8>,
     grant: Grant,
-    on_notify: Callback<(String, String)>,
 ) -> Result<(), String> {
     let id = manifest.id.clone();
+    validate_memory_limit(&bytes, manifest.max_pages)?;
 
-    REGISTRY.with(|r| {
-        let reg = r.borrow();
-        if reg.apps.iter().any(|a| a.manifest.id == id) {
-            return Err(format!("plugin '{id}' is already installed"));
-        }
-        Ok(())
-    })?;
-
-    // Persist to the VFS: manifest as JSON, wasm as base64 (localStorage is a
-    // string store — see plan §11).
+    // Persist raw bytes first, then keep only the small, inspectable manifest
+    // in the VFS. Roll back the IndexedDB record if the manifest write fails.
+    wasm_store::put(&id, &bytes).await?;
     let manifest_path = format!("{APPLICATIONS_DIR}/{id}.json");
-    let wasm_path = format!("{APPLICATIONS_DIR}/{id}.wasm.b64");
-    {
+    let manifest_result = (|| -> Result<(), String> {
         let mut fs = fs.borrow_mut();
         if !fs.is_directory(APPLICATIONS_DIR) {
             fs.create_directory(APPLICATIONS_DIR, true)?;
         }
         let raw = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
         fs.write_file(&manifest_path, &raw)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        fs.write_file(&wasm_path, &b64)?;
+        Ok(())
+    })();
+    if let Err(e) = manifest_result {
+        let _ = wasm_store::delete(&id).await;
+        return Err(e);
     }
 
-    REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        if reg.apps.iter().any(|a| a.manifest.id == id) {
-            return Err(format!("plugin '{id}' is already installed"));
+    if let Err(e) = save_grant(fs, &id, &grant) {
+        let _ = wasm_store::delete(&id).await;
+        let mut filesystem = fs.borrow_mut();
+        if filesystem.exists(&manifest_path) {
+            let _ = filesystem.delete(&manifest_path, false);
         }
-        let _ = on_notify;
-        reg.apps.push(PluginApp {
+        return Err(e);
+    }
+
+    // A previously installed unbounded module is intentionally not migrated,
+    // but a successful bounded reinstall should still release its base64 quota.
+    let legacy_path = format!("{APPLICATIONS_DIR}/{id}.wasm.b64");
+    let mut filesystem = fs.borrow_mut();
+    if filesystem.exists(&legacy_path) {
+        if let Err(e) = filesystem.delete(&legacy_path, false) {
+            log::warn!("plugin {id}: installed but could not remove legacy payload: {e}");
+        }
+    }
+    drop(filesystem);
+
+    REGISTRY.with(|r| {
+        r.borrow_mut().apps.push(PluginApp {
             manifest,
             bytes,
             grant,
         });
-        Ok(())
-    })
+    });
+    if BUNDLED_PLUGINS.contains(&id.as_str()) {
+        // Installation is already durable. A stale disable marker is harmless
+        // while the manifest exists, so do not turn a successful install into
+        // a reported failure if this small preference write is interrupted.
+        if let Err(e) = set_bundled_plugin_disabled(fs, &id, false) {
+            log::warn!("plugin {id}: installed but could not clear disabled marker: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// Look up a previously consented grant. Never fabricates one.
@@ -607,10 +867,14 @@ pub(crate) fn stored_grant(fs: &Rc<RefCell<FileSystem>>, id: &str) -> Option<Gra
     load_permissions(fs).grants.get(id).cloned()
 }
 
-fn save_grant(fs: &Rc<RefCell<FileSystem>>, id: &str, grant: &Grant) {
+fn save_grant(
+    fs: &Rc<RefCell<FileSystem>>,
+    id: &str,
+    grant: &Grant,
+) -> Result<(), String> {
     let mut store = load_permissions(fs);
     store.grants.insert(id.to_string(), grant.clone());
-    save_permissions(fs, &store);
+    save_permissions(fs, &store)
 }
 
 fn load_permissions(fs: &Rc<RefCell<FileSystem>>) -> PermissionsStore {
@@ -621,13 +885,47 @@ fn load_permissions(fs: &Rc<RefCell<FileSystem>>) -> PermissionsStore {
         .unwrap_or_default()
 }
 
-fn save_permissions(fs: &Rc<RefCell<FileSystem>>, store: &PermissionsStore) {
-    if let Ok(raw) = serde_json::to_string_pretty(store) {
-        let mut fs = fs.borrow_mut();
-        if !fs.is_directory("/system/config") {
-            let _ = fs.create_directory("/system/config", true);
-        }
-        let _ = fs.write_file(PERMISSIONS_PATH, &raw);
+fn save_permissions(
+    fs: &Rc<RefCell<FileSystem>>,
+    store: &PermissionsStore,
+) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+    let mut filesystem = fs.borrow_mut();
+    if !filesystem.is_directory("/system/config") {
+        filesystem.create_directory("/system/config", true)?;
+    }
+    filesystem.write_file(PERMISSIONS_PATH, &raw)
+}
+
+fn load_disabled_bundled_plugins(fs: &Rc<RefCell<FileSystem>>) -> BTreeSet<String> {
+    fs.borrow()
+        .read_file(DISABLED_BUNDLED_PLUGINS_PATH)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn set_bundled_plugin_disabled(
+    fs: &Rc<RefCell<FileSystem>>,
+    id: &str,
+    disabled: bool,
+) -> Result<(), String> {
+    let mut ids = load_disabled_bundled_plugins(fs);
+    update_bundled_plugin_disabled(&mut ids, id, disabled);
+
+    let raw = serde_json::to_string_pretty(&ids).map_err(|e| e.to_string())?;
+    let mut filesystem = fs.borrow_mut();
+    if !filesystem.is_directory("/system/config") {
+        filesystem.create_directory("/system/config", true)?;
+    }
+    filesystem.write_file(DISABLED_BUNDLED_PLUGINS_PATH, &raw)
+}
+
+fn update_bundled_plugin_disabled(ids: &mut BTreeSet<String>, id: &str, disabled: bool) {
+    if disabled {
+        ids.insert(id.to_string());
+    } else {
+        ids.remove(id);
     }
 }
 
@@ -674,9 +972,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_pages, stored_grant, WASM_PAGE_SIZE};
+    use super::{
+        check_pages, decode_legacy_wasm, stored_grant, update_bundled_plugin_disabled,
+        validate_manifest_limits, validate_memory_limit, validate_plugin_id, WASM_PAGE_SIZE,
+    };
     use crate::filesystem::FileSystem;
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     #[test]
@@ -697,5 +999,67 @@ mod tests {
         // stored_grant must not invent a grant for an unknown id.
         let fs = Rc::new(RefCell::new(FileSystem::default()));
         assert!(stored_grant(&fs, "unknown-plugin").is_none());
+    }
+
+    #[test]
+    fn legacy_wasm_payload_decodes_for_indexeddb_migration() {
+        assert_eq!(
+            decode_legacy_wasm("  AGFzbQEAAAA=\n").unwrap(),
+            b"\0asm\x01\0\0\0"
+        );
+        assert_eq!(
+            decode_legacy_wasm("not base64").unwrap_err(),
+            "corrupt legacy wasm payload"
+        );
+    }
+
+    #[test]
+    fn plugin_memory_requires_a_hard_maximum_within_manifest_cap() {
+        let bounded = b"\0asm\x01\0\0\0\x05\x05\x01\x01\x01\x80\x02";
+        assert!(validate_memory_limit(bounded, 256).is_ok());
+
+        let unbounded = b"\0asm\x01\0\0\0\x05\x03\x01\x00\x01";
+        assert_eq!(
+            validate_memory_limit(unbounded, 256).unwrap_err(),
+            "plugin memory has no hard maximum"
+        );
+
+        let oversized = b"\0asm\x01\0\0\0\x05\x05\x01\x01\x01\x81\x02";
+        assert_eq!(
+            validate_memory_limit(oversized, 256).unwrap_err(),
+            "plugin memory maximum 257 exceeds manifest cap 256"
+        );
+    }
+
+    #[test]
+    fn manifest_cannot_raise_the_host_memory_ceiling() {
+        let manifest: crate::plugin::abi::PluginManifest = serde_json::from_str(
+            r#"{"id":"large","name":"Large","icon":"L","max_pages":257}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_manifest_limits(&manifest).unwrap_err(),
+            "manifest max_pages 257 is outside the host range 1..=256"
+        );
+    }
+
+    #[test]
+    fn plugin_ids_cannot_escape_storage_paths() {
+        assert!(validate_plugin_id("doc-viewer").is_ok());
+        assert_eq!(
+            validate_plugin_id("../../system/config/session").unwrap_err(),
+            "plugin id must be a lowercase alphanumeric slug with optional hyphens"
+        );
+    }
+
+    #[test]
+    fn bundled_plugin_disable_marker_round_trips() {
+        let mut disabled = BTreeSet::new();
+
+        update_bundled_plugin_disabled(&mut disabled, "hello", true);
+        assert!(disabled.contains("hello"));
+
+        update_bundled_plugin_disabled(&mut disabled, "hello", false);
+        assert!(!disabled.contains("hello"));
     }
 }

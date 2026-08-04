@@ -74,7 +74,7 @@ cat /system/config/session.json
 ## Quick Start
 
 ### Prerequisites
-- [Rust](https://rustup.rs/) (1.85+ — required by `yew` 0.23 and `rand` 0.10)
+- [Rust](https://rustup.rs/) 1.92.0 (pinned by `rust-toolchain.toml`)
 - [trunk](https://trunkrs.dev/) (`cargo install trunk`)
 - wasm32 target (`rustup target add wasm32-unknown-unknown`)
 
@@ -90,6 +90,9 @@ cargo install trunk
 # Add wasm target
 rustup target add wasm32-unknown-unknown
 
+# Build and stage every plugin with its 16 MiB hard memory cap
+./build-plugins.sh
+
 # Run development server
 trunk serve
 
@@ -98,6 +101,12 @@ trunk build --release
 ```
 
 Open http://localhost:8080 in your browser.
+
+Run `./build-plugins.sh check` in CI or before committing to verify the staged
+plugin manifests and WASM modules match a clean release build. The bundled
+`hello` plugin installs automatically; use `pkg install doc-viewer` in the
+KernelOS Terminal to exercise capability consent, persisted plugin state, and
+read-only access to `/home/documents`.
 
 ## Project Structure
 

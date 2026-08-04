@@ -421,14 +421,27 @@ impl Terminal {
                     ));
                     return;
                 };
-                match crate::plugin::uninstall(id, &self.fs) {
-                    Ok(()) => self.output_lines.push(TerminalLine::Success(format!(
-                        "Removed '{id}'."
-                    ))),
-                    Err(e) => self
-                        .output_lines
-                        .push(TerminalLine::Error(format!("pkg remove: {e}"))),
-                }
+                let id = id.to_string();
+                let fs = Rc::clone(&self.fs);
+                let link = ctx.link().clone();
+                let on_notification = ctx.props().on_notification.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::plugin::uninstall(&id, &fs).await {
+                        Ok(()) => {
+                            on_notification.emit((
+                                "Plugins".to_string(),
+                                format!("Removed '{id}'."),
+                                "success".to_string(),
+                            ));
+                            link.send_message(TerminalMsg::Output(format!(
+                                "Removed '{id}'."
+                            )));
+                        }
+                        Err(e) => link.send_message(TerminalMsg::Error(format!(
+                            "pkg remove: {e}"
+                        ))),
+                    }
+                });
             }
             _ => {
                 self.output_lines.push(TerminalLine::Output(
@@ -473,6 +486,7 @@ impl Terminal {
             })
         };
         let link = ctx.link().clone();
+        let on_installed = ctx.props().on_notification.clone();
         let grant = Grant(pending.manifest.requests.clone());
         let spec = pending.spec.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -485,9 +499,16 @@ impl Terminal {
             )
             .await
             {
-                Ok(()) => link.send_message(TerminalMsg::Output(format!(
-                    "Installed '{spec}'."
-                ))),
+                Ok(()) => {
+                    on_installed.emit((
+                        "Plugins".to_string(),
+                        format!("Installed '{spec}'."),
+                        "success".to_string(),
+                    ));
+                    link.send_message(TerminalMsg::Output(format!(
+                        "Installed '{spec}'."
+                    )));
+                }
                 Err(e) => link.send_message(TerminalMsg::Error(format!(
                     "pkg install: {e}"
                 ))),

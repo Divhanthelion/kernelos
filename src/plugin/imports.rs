@@ -37,13 +37,18 @@ impl InstanceShared {
 
     fn write_result(&self, data: &[u8]) -> Result<i32, String> {
         let (guest, alloc) = self.guest()?;
-        let ptr = call_i32(&alloc, &[&JsValue::from_f64(data.len() as f64)])?;
+        // Guest `alloc(0)` is defined as failure, but an empty file is a valid
+        // result. Reserve one byte while keeping the returned payload length 0.
+        let allocation_len = data.len().max(1);
+        let ptr = call_i32(&alloc, &[&JsValue::from_f64(allocation_len as f64)])?;
         if ptr <= 0 {
             return Err("guest alloc failed".into());
         }
-        guest
-            .write(ptr as u32, data)
-            .map_err(|e| e.to_string())?;
+        if !data.is_empty() {
+            guest
+                .write(ptr as u32, data)
+                .map_err(|e| e.to_string())?;
+        }
         let hdr_ptr = call_i32(&alloc, &[&JsValue::from_f64(8.0)])?;
         if hdr_ptr <= 0 {
             return Err("guest alloc for header failed".into());
@@ -139,7 +144,9 @@ pub fn build_imports(shared: Rc<InstanceShared>) -> Object {
             let Some(path) = allow_vfs_path(&prefix, &path) else {
                 return 0;
             };
-            let content = s.fs.borrow().read_file(&path).unwrap_or_default();
+            let Ok(content) = s.fs.borrow().read_file(&path) else {
+                return 0;
+            };
             s.write_result(content.as_bytes()).unwrap_or(0)
         }) as Box<dyn Fn(i32, i32) -> i32>);
         let _ = Reflect::set(

@@ -323,6 +323,13 @@ impl Component for Window {
             e.stop_propagation();
             WindowMsg::Maximize
         });
+        let on_controls_pointerdown = ctx.link().callback(|e: PointerEvent| {
+            // The controls live inside the draggable titlebar. Stop the press
+            // here so the titlebar does not capture the pointer and swallow the
+            // button's subsequent click.
+            e.stop_propagation();
+            WindowMsg::Focus
+        });
 
         let on_resize_right = grab(DragMode::ResizeRight);
         let on_resize_bottom = grab(DragMode::ResizeBottom);
@@ -355,21 +362,24 @@ impl Component for Window {
                     ondblclick={on_titlebar_dblclick}
                 >
                     <span class="window-title">{ &title }</span>
-                    <div class="window-controls">
+                    <div class="window-controls" onpointerdown={on_controls_pointerdown}>
                         <button
                             class="window-control minimize"
                             onclick={on_minimize}
                             title="Minimize"
+                            aria-label="Minimize window"
                         />
                         <button
                             class="window-control maximize"
                             onclick={on_maximize}
                             title={if is_maximized { "Restore" } else { "Maximize" }}
+                            aria-label={if is_maximized { "Restore window" } else { "Maximize window" }}
                         />
                         <button
                             class="window-control close"
                             onclick={on_close}
                             title="Close"
+                            aria-label="Close window"
                         />
                     </div>
                 </div>

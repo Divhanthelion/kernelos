@@ -26,6 +26,8 @@ pub struct Desktop {
     theme: String,
     accent: String,
     wallpaper: String,
+    /// Session restore waits until asynchronous plugin storage is ready.
+    pending_session: Option<Session>,
 }
 
 pub enum DesktopMsg {
@@ -64,9 +66,11 @@ pub enum DesktopMsg {
     SetAccent(String),
     SetWallpaper(String),
 
-    /// A bundled plugin finished loading in the background; re-render so the
-    /// menus, icons and quick launch pick up the new entry.
+    /// A plugin finished loading in the background; re-render so menus, icons
+    /// and quick launch pick up the new entry.
     PluginsChanged,
+    /// Persisted plugin bytes are loaded and saved windows can be restored.
+    PluginsReady,
 }
 
 impl Component for Desktop {
@@ -87,8 +91,9 @@ impl Component for Desktop {
             })
         };
         let on_plugins_changed = ctx.link().callback(|_| DesktopMsg::PluginsChanged);
+        let on_plugins_ready = ctx.link().callback(|_| DesktopMsg::PluginsReady);
 
-        let mut desktop = Self {
+        let desktop = Self {
             fs,
             windows: Vec::new(),
             next_window_id: 1,
@@ -99,17 +104,18 @@ impl Component for Desktop {
             theme: config.theme,
             accent: config.accent,
             wallpaper: config.wallpaper,
+            pending_session: Some(session),
         };
 
-        // Load installed plugins synchronously, fetch bundled ones in the
-        // background (they register and then Desktop re-renders).
+        // IndexedDB plugin bytes load asynchronously. Session restore is
+        // deferred until the registry is ready.
         plugin::init(
             Rc::clone(&desktop.fs),
             on_plugin_notify.clone(),
             on_plugins_changed,
+            on_plugins_ready,
         );
 
-        desktop.restore_session(session, &on_plugin_notify);
         desktop
     }
 
@@ -265,9 +271,25 @@ impl Component for Desktop {
                 false
             }
             DesktopMsg::PluginsChanged => {
-                // A bundled plugin finished loading in the background; menus,
-                // icons and quick launch all read the registry fresh each
+                // Menus, icons and quick launch read the registry fresh each
                 // render, so a re-render is all that is needed.
+                true
+            }
+            DesktopMsg::PluginsReady => {
+                if let Some(session) = self.pending_session.take() {
+                    let link = ctx.link().clone();
+                    let on_plugin_notify = Callback::from(move |(title, body): (String, String)| {
+                        link.send_message(DesktopMsg::ShowNotification(
+                            title,
+                            body,
+                            "info".to_string(),
+                        ));
+                    });
+                    self.restore_session(session, &on_plugin_notify);
+                    // Persist the merged result, including any windows the user
+                    // opened while plugin storage was still hydrating.
+                    self.save_session();
+                }
                 true
             }
         }
@@ -469,6 +491,11 @@ impl Desktop {
     }
 
     fn save_session(&self) {
+        // Do not overwrite the previous session while IndexedDB-backed plugin
+        // state is still loading and its windows have not been restored.
+        if self.pending_session.is_some() {
+            return;
+        }
         let session = Session {
             windows: self.windows.iter().map(|window| {
                 let w = window.borrow();

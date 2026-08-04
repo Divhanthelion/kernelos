@@ -3,12 +3,18 @@
   "name": "Hello Plugin",
   "icon": "👋",
   "abi_version": 1,
-  "requests": [{ "cap": "notify" }],
+  "requests": [
+    {
+      "cap": "notify"
+    }
+  ],
   "category": "Plugins",
   "on_desktop": true,
   "in_quick_launch": true,
   "width": 360,
   "height": 280,
   "min_width": 240,
-  "min_height": 180
+  "min_height": 180,
+  "max_pages": 256,
+  "wasm_hash": "5a35ad9e58bdd7812b7f6a056c08b35360f1db049631394283878b849a98cf6a"
 }

@@ -8,25 +8,58 @@ pub struct RenderContext {
     pub on_event: Callback<Event>,
 }
 
+enum Layout {
+    Root,
+    VBox(u8),
+    HBox(u8),
+}
+
+struct Frame {
+    layout: Layout,
+    children: Vec<Html>,
+}
+
+fn close_frame(frame: Frame) -> Html {
+    match frame.layout {
+        Layout::Root => html! { <>{ for frame.children }</> },
+        Layout::VBox(gap) => html! {
+            <div class="plugin-vbox" style={format!("gap: {gap}px")}>
+                { for frame.children }
+            </div>
+        },
+        Layout::HBox(gap) => html! {
+            <div class="plugin-hbox" style={format!("gap: {gap}px")}>
+                { for frame.children }
+            </div>
+        },
+    }
+}
+
 pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
-    let mut stack: Vec<Vec<Html>> = vec![vec![]];
+    let mut stack = vec![Frame {
+        layout: Layout::Root,
+        children: vec![],
+    }];
 
     for op in ops {
         match op {
             UiOp::BeginVBox { gap } => {
-                stack.push(vec![]);
-                let _ = gap; // gap applied via CSS class for now
+                stack.push(Frame {
+                    layout: Layout::VBox(*gap),
+                    children: vec![],
+                });
             }
             UiOp::BeginHBox { gap } => {
-                stack.push(vec![]);
-                let _ = gap;
+                stack.push(Frame {
+                    layout: Layout::HBox(*gap),
+                    children: vec![],
+                });
             }
             UiOp::End => {
                 if stack.len() > 1 {
-                    let children = stack.pop().unwrap_or_default();
-                    let inner = html! { <>{ for children }</> };
+                    let inner = close_frame(stack.pop().expect("nested plugin frame"));
                     if let Some(parent) = stack.last_mut() {
-                        parent.push(inner);
+                        parent.children.push(inner);
                     }
                 }
             }
@@ -36,7 +69,7 @@ pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
                 let class = class.as_deref().unwrap_or("plugin-label").to_string();
                 let node = html! { <p class={class}>{ text.clone() }</p> };
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(node);
+                    parent.children.push(node);
                 }
             }
             UiOp::Button { id, text } => {
@@ -54,7 +87,7 @@ pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
                     </button>
                 };
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(node);
+                    parent.children.push(node);
                 }
             }
             UiOp::Input {
@@ -80,7 +113,7 @@ pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
                     />
                 };
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(node);
+                    parent.children.push(node);
                 }
             }
             UiOp::Checkbox { id, checked, label } => {
@@ -103,7 +136,7 @@ pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
                     </label>
                 };
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(node);
+                    parent.children.push(node);
                 }
             }
             UiOp::List { items, selected } => {
@@ -120,13 +153,19 @@ pub fn render_ops(ops: &[UiOp], ctx: &RenderContext) -> Html {
                     </ul>
                 };
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(node);
+                    parent.children.push(node);
                 }
             }
         }
     }
 
-    let root = stack.pop().unwrap_or_default();
+    while stack.len() > 1 {
+        let inner = close_frame(stack.pop().expect("nested plugin frame"));
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(inner);
+        }
+    }
+    let root = stack.pop().map(|frame| frame.children).unwrap_or_default();
     html! {
         <div class="plugin-ui">
             { for root }

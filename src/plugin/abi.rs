@@ -81,8 +81,9 @@ pub struct PluginManifest {
     pub min_width: i32,
     #[serde(default = "default_min_height")]
     pub min_height: i32,
-    /// Soft cap on guest linear memory, in WASM pages (64 KiB each).
-    /// Default 256 → 16 MiB. Existing manifests without the field keep parsing.
+    /// Per-plugin guest-memory ceiling, in WASM pages (64 KiB each). The host
+    /// rejects values above its global cap and requires the module's hard
+    /// maximum to fit. Default 256 → 16 MiB.
     #[serde(default = "default_max_pages")]
     pub max_pages: u32,
 }

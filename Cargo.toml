@@ -55,3 +55,6 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [profile.release]
 opt-level = "s"
 lto = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rexie = "0.6.2"
