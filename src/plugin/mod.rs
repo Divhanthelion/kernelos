@@ -42,6 +42,22 @@ pub const APPLICATIONS_DIR: &str = "/applications";
 /// and then persisted into the VFS like any installed plugin.
 const BUNDLED_PLUGINS: &[&str] = &["hello"];
 
+/// WASM page size in bytes. Guest memory is always a multiple of this.
+pub(crate) const WASM_PAGE_SIZE: u32 = 65536;
+
+/// Return `Ok(())` if `byte_length` fits in `max_pages`, else an error naming
+/// both the observed and capped page counts (for the crash-card message).
+pub(crate) fn check_pages(byte_length: u32, max_pages: u32) -> Result<(), String> {
+    let pages = byte_length / WASM_PAGE_SIZE;
+    if pages > max_pages {
+        Err(format!(
+            "memory limit exceeded ({pages} > {max_pages} pages)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // ── Per-window instance ──────────────────────────────────────────────────────
 
 /// One WASM instance, owned by exactly one window. Two windows of the same
@@ -52,6 +68,7 @@ pub struct PluginHandle {
     reset_fn: Function,
     update_fn: Function,
     render_fn: Function,
+    max_pages: u32,
     crashed: bool,
     crash_message: Option<String>,
     ops: Vec<UiOp>,
@@ -77,6 +94,7 @@ impl PluginHandle {
         reset_fn: Function,
         update_fn: Function,
         render_fn: Function,
+        max_pages: u32,
     ) -> Self {
         Self {
             id,
@@ -84,6 +102,7 @@ impl PluginHandle {
             reset_fn,
             update_fn,
             render_fn,
+            max_pages,
             crashed: false,
             crash_message: None,
             ops: Vec::new(),
@@ -123,14 +142,33 @@ impl PluginHandle {
                 .clone()
                 .unwrap_or_else(|| "plugin crashed".to_string()));
         }
+        // Cap guest linear memory before every call so a runaway alloc loop
+        // trips the crash card instead of OOMing the tab (HANDOFF P0-2).
+        if let Err(e) = self.check_memory_cap() {
+            self.set_crash(e.clone());
+            return Err(e);
+        }
         match self.send_inner(event) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Growth during the call is visible here; trip before the next frame.
+                if let Err(e) = self.check_memory_cap() {
+                    self.set_crash(e.clone());
+                    return Err(e);
+                }
+                Ok(())
+            }
             Err(e) => {
                 self.crashed = true;
                 self.crash_message = Some(e.clone());
                 Err(e)
             }
         }
+    }
+
+    /// Fail if the guest's current memory exceeds `max_pages`.
+    fn check_memory_cap(&self) -> Result<(), String> {
+        let (guest, _) = self.shared.guest()?;
+        check_pages(guest.byte_length(), self.max_pages)
     }
 
     fn send_inner(&mut self, event: &Event) -> Result<(), String> {
@@ -481,6 +519,7 @@ fn instantiate_bytes(
         reset_fn,
         update_fn,
         render_fn,
+        manifest.max_pages,
     );
 
     // Pull the initial frame so the window has something to render immediately.
@@ -605,4 +644,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_pages, WASM_PAGE_SIZE};
+
+    #[test]
+    fn memory_cap_allows_at_limit() {
+        assert!(check_pages(256 * WASM_PAGE_SIZE, 256).is_ok());
+        assert!(check_pages(0, 256).is_ok());
+    }
+
+    #[test]
+    fn memory_cap_rejects_over_limit() {
+        let err = check_pages(257 * WASM_PAGE_SIZE, 256).unwrap_err();
+        assert_eq!(err, "memory limit exceeded (257 > 256 pages)");
+    }
 }

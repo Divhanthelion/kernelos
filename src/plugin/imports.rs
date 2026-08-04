@@ -134,9 +134,11 @@ pub fn build_imports(shared: Rc<InstanceShared>) -> Object {
             let Ok(path) = serde_json::from_slice::<String>(&bytes) else {
                 return 0;
             };
-            if !path.starts_with(&prefix) {
+            // Normalize *before* the grant check — raw `starts_with` misses `..`
+            // traversal and has no path-boundary (see HANDOFF P0-1).
+            let Some(path) = allow_vfs_path(&prefix, &path) else {
                 return 0;
-            }
+            };
             let content = s.fs.borrow().read_file(&path).unwrap_or_default();
             s.write_result(content.as_bytes()).unwrap_or(0)
         }) as Box<dyn Fn(i32, i32) -> i32>);
@@ -148,9 +150,26 @@ pub fn build_imports(shared: Rc<InstanceShared>) -> Object {
         vfs_read.forget();
     }
 
+    // Capability::VfsWrite / Grant::vfs_write_prefix exist in the ABI, but no
+    // `host_vfs_write` import is wired here (and the PDK does not declare one).
+    // Leave it unimplemented rather than ship a write path with a raw
+    // `starts_with` gate — when VfsWrite lands it must use `allow_vfs_path`.
+
     let imports = Object::new();
     let _ = Reflect::set(&imports, &"env".into(), &env);
     imports
+}
+
+/// Normalize grant prefix and guest path, then enforce boundary-aware
+/// containment. Returns the normalized path if allowed.
+pub(crate) fn allow_vfs_path(prefix: &str, guest_path: &str) -> Option<String> {
+    let prefix = FileSystem::normalize_path(prefix);
+    let path = FileSystem::normalize_path(guest_path);
+    if FileSystem::is_inside(&prefix, &path) {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub fn fill_shared(shared: &InstanceShared, instance: &WebAssembly::Instance) -> Result<(), String> {
@@ -166,4 +185,49 @@ pub fn fill_shared(shared: &InstanceShared, instance: &WebAssembly::Instance) ->
     *shared.memory.borrow_mut() = Some(memory);
     *shared.alloc.borrow_mut() = Some(alloc);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allow_vfs_path;
+
+    #[test]
+    fn vfs_read_rejects_dotdot_traversal() {
+        // Proven P0-1 exploit: raw starts_with("/home/documents") passes this
+        // string, but after normalize it escapes to /system/config/theme.json.
+        assert_eq!(
+            allow_vfs_path(
+                "/home/documents",
+                "/home/documents/../../system/config/theme.json"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vfs_read_rejects_prefix_without_boundary() {
+        // "/home/doc" must not grant "/home/documents-private/...".
+        assert_eq!(
+            allow_vfs_path("/home/doc", "/home/documents-private/secrets"),
+            None
+        );
+    }
+
+    #[test]
+    fn vfs_read_allows_paths_inside_grant() {
+        assert_eq!(
+            allow_vfs_path("/home/documents", "/home/documents/readme.txt"),
+            Some("/home/documents/readme.txt".into())
+        );
+        // Sloppy trailing slash on the grant still works after normalize.
+        assert_eq!(
+            allow_vfs_path("/home/documents/", "/home/documents/notes/a.txt"),
+            Some("/home/documents/notes/a.txt".into())
+        );
+        // Exact grant root is allowed.
+        assert_eq!(
+            allow_vfs_path("/home/documents", "/home/documents"),
+            Some("/home/documents".into())
+        );
+    }
 }

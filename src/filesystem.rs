@@ -542,9 +542,10 @@ impl FileSystem {
             .collect()
     }
 
-    /// True if `dest` sits inside `src`, which would make a move or copy
-    /// of `src` into `dest` recurse forever.
-    fn is_inside(src: &str, dest: &str) -> bool {
+    /// True if `dest` sits inside `src` (equal, or a path under `src/` with a
+    /// directory boundary). Used by move/copy cycle detection and by plugin
+    /// VFS capability checks — do not replace with raw `starts_with`.
+    pub fn is_inside(src: &str, dest: &str) -> bool {
         dest == src || dest.starts_with(&format!("{}/", src))
     }
 

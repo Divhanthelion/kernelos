@@ -81,6 +81,10 @@ pub struct PluginManifest {
     pub min_width: i32,
     #[serde(default = "default_min_height")]
     pub min_height: i32,
+    /// Soft cap on guest linear memory, in WASM pages (64 KiB each).
+    /// Default 256 → 16 MiB. Existing manifests without the field keep parsing.
+    #[serde(default = "default_max_pages")]
+    pub max_pages: u32,
 }
 
 fn default_abi_version() -> u32 {
@@ -103,6 +107,9 @@ fn default_min_width() -> i32 {
 }
 fn default_min_height() -> i32 {
     150
+}
+fn default_max_pages() -> u32 {
+    256
 }
 
 /// Approved capability subset for a plugin instance.
@@ -168,5 +175,17 @@ mod tests {
         let bytes = serde_json::to_vec(&ops).unwrap();
         let back = decode_ui_ops(&bytes).unwrap();
         assert_eq!(back, ops);
+    }
+
+    #[test]
+    fn manifest_defaults_max_pages_without_field() {
+        // plugins/hello.json has no max_pages — must still parse as 256.
+        let raw = r#"{
+            "id": "hello",
+            "name": "Hello Plugin",
+            "icon": "👋"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.max_pages, 256);
     }
 }
