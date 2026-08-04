@@ -1,38 +1,6 @@
 use yew::prelude::*;
-use wasm_bindgen::JsCast;
 
-#[derive(Clone, PartialEq)]
-pub struct AppEntry {
-    pub id: String,
-    pub name: String,
-    pub icon: String,
-    pub category: String,
-}
-
-impl AppEntry {
-    pub fn new(id: &str, name: &str, icon: &str, category: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            icon: icon.to_string(),
-            category: category.to_string(),
-        }
-    }
-}
-
-pub fn get_default_apps() -> Vec<AppEntry> {
-    vec![
-        AppEntry::new("file-explorer", "File Explorer", "📁", "System"),
-        AppEntry::new("terminal", "Terminal", "💻", "System"),
-        AppEntry::new("text-editor", "Text Editor", "📝", "Productivity"),
-        AppEntry::new("calculator", "Calculator", "🔢", "Utilities"),
-        AppEntry::new("clock", "Clock", "🕐", "Utilities"),
-        AppEntry::new("paint", "Paint", "🎨", "Creative"),
-        AppEntry::new("minesweeper", "Minesweeper", "💣", "Games"),
-        AppEntry::new("settings", "Settings", "⚙️", "System"),
-        AppEntry::new("about", "About KernelOS", "ℹ️", "System"),
-    ]
-}
+use crate::apps::{self, AppDefinition};
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct StartMenuProps {
@@ -43,7 +11,6 @@ pub struct StartMenuProps {
 
 pub struct StartMenu {
     search_query: String,
-    apps: Vec<AppEntry>,
 }
 
 pub enum StartMenuMsg {
@@ -59,7 +26,6 @@ impl Component for StartMenu {
     fn create(_ctx: &Context<Self>) -> Self {
         Self {
             search_query: String::new(),
-            apps: get_default_apps(),
         }
     }
 
@@ -86,15 +52,13 @@ impl Component for StartMenu {
             return html! {};
         }
 
-        let filtered_apps: Vec<&AppEntry> = self.apps
-            .iter()
+        let query = self.search_query.to_lowercase();
+        let filtered_apps: Vec<apps::AppInfo> = apps::all_apps()
+            .into_iter()
             .filter(|app| {
-                if self.search_query.is_empty() {
-                    true
-                } else {
-                    app.name.to_lowercase().contains(&self.search_query.to_lowercase()) ||
-                    app.category.to_lowercase().contains(&self.search_query.to_lowercase())
-                }
+                query.is_empty()
+                    || app.title.to_lowercase().contains(&query)
+                    || app.category.to_lowercase().contains(&query)
             })
             .collect();
 
@@ -108,51 +72,35 @@ impl Component for StartMenu {
         html! {
             <>
                 <div 
-                    style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1400;"
+                    class="start-menu-backdrop"
                     onclick={on_overlay_click}
                 />
-                <div class="start-menu" style="position: fixed; bottom: 56px; left: 8px; width: 320px; max-height: 500px; background-color: #2d2d2d; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); z-index: 1500; overflow: hidden; border: 1px solid rgba(255,255,255,0.1);">
-                    <div class="start-menu-header" style="padding: 16px; background: linear-gradient(135deg, #4a9eff 0%, #e94560 100%); color: white;">
+                <div class="start-menu">
+                    <div class="start-menu-header">
                         <input 
                             type="text"
                             placeholder="Search apps..."
                             value={self.search_query.clone()}
                             oninput={on_search}
-                            style="width: 100%; padding: 10px 14px; border: none; border-radius: 8px; background-color: rgba(255,255,255,0.2); color: white; font-size: 14px; outline: none;"
+                            class="start-menu-search"
                         />
                     </div>
-                    <div class="start-menu-apps" style="padding: 8px; max-height: 380px; overflow-y: auto;">
+                    <div class="start-menu-apps">
                         {
                             filtered_apps.iter().map(|app| {
                                 let app_id = app.id.clone();
                                 let on_click = ctx.link().callback(move |_| {
+                                    // callback is Fn and may run many times, so
+                                    // clone out of the capture each invocation.
                                     StartMenuMsg::LaunchApp(app_id.clone())
                                 });
                                 
                                 html! {
-                                    <div 
-                                        class="start-menu-app"
-                                        style="display: flex; align-items: center; padding: 12px; border-radius: 8px; cursor: pointer; transition: background-color 0.15s ease;"
-                                        onclick={on_click}
-                                        onmouseover={Callback::from(|e: MouseEvent| {
-                                            if let Some(target) = e.target() {
-                                                if let Some(el) = target.dyn_ref::<web_sys::HtmlElement>() {
-                                                    let _ = el.style().set_property("background-color", "rgba(255,255,255,0.1)");
-                                                }
-                                            }
-                                        })}
-                                        onmouseout={Callback::from(|e: MouseEvent| {
-                                            if let Some(target) = e.target() {
-                                                if let Some(el) = target.dyn_ref::<web_sys::HtmlElement>() {
-                                                    let _ = el.style().set_property("background-color", "transparent");
-                                                }
-                                            }
-                                        })}
-                                    >
-                                        <span style="font-size: 28px; margin-right: 14px;">{ &app.icon }</span>
+                                    <div class="start-menu-app" onclick={on_click}>
+                                        <span class="start-menu-app-icon">{ &app.icon }</span>
                                         <div>
-                                            <div style="color: white; font-size: 14px; font-weight: 500;">{ &app.name }</div>
-                                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">{ &app.category }</div>
+                                            <div class="start-menu-app-name">{ &app.title }</div>
+                                            <div class="start-menu-app-category">{ &app.category }</div>
                                         </div>
                                     </div>
                                 }
@@ -161,7 +109,7 @@ impl Component for StartMenu {
                         {
                             if filtered_apps.is_empty() {
                                 html! {
-                                    <div style="padding: 24px; text-align: center; color: rgba(255,255,255,0.5);">
+                                    <div class="start-menu-empty">
                                         { "No apps found" }
                                     </div>
                                 }

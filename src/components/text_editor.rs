@@ -190,37 +190,37 @@ impl Component for TextEditor {
         };
 
         html! {
-            <div class="text-editor" style="display: flex; flex-direction: column; height: 100%; background-color: #1e1e1e;">
+            <div class="text-editor">
                 // Toolbar
-                <div style="display: flex; align-items: center; padding: 8px; gap: 8px; border-bottom: 1px solid #333; background-color: #252526;">
-                    <span style="color: #d4d4d4; font-size: 13px; margin-right: 8px;">{ title }</span>
-                    <div style="flex: 1;" />
+                <div class="text-editor-toolbar">
+                    <span class="text-editor-title">{ title }</span>
+                    <div class="text-editor-spacer" />
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #4a9eff; color: white; cursor: pointer; font-size: 12px;"
+                        class="btn btn-primary btn-small"
                         onclick={ctx.link().callback(|_| TextEditorMsg::Save)}
                         title="Save (Ctrl+S)"
                     >
                         { "💾 Save" }
                     </button>
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer; font-size: 12px;"
+                        class="btn btn-secondary btn-small"
                         onclick={ctx.link().callback(|_| TextEditorMsg::ToggleWordWrap)}
                         title="Toggle Word Wrap"
                     >
                         { if self.word_wrap { "↩️ Wrap" } else { "→ No Wrap" } }
                     </button>
                     <button 
-                        style="padding: 6px 8px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer; font-size: 12px;"
+                        class="btn btn-secondary btn-small"
                         onclick={ctx.link().callback(|_| TextEditorMsg::DecreaseFontSize)}
                         title="Decrease Font Size (Ctrl+-)"
                     >
                         { "A-" }
                     </button>
-                    <span style="color: #888; font-size: 11px; min-width: 30px; text-align: center;">
+                    <span class="text-editor-fontsize">
                         { format!("{}px", self.font_size) }
                     </span>
                     <button 
-                        style="padding: 6px 8px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer; font-size: 12px;"
+                        class="btn btn-secondary btn-small"
                         onclick={ctx.link().callback(|_| TextEditorMsg::IncreaseFontSize)}
                         title="Increase Font Size (Ctrl++)"
                     >
@@ -229,15 +229,15 @@ impl Component for TextEditor {
                 </div>
                 
                 // Editor area with line numbers
-                <div style="flex: 1; display: flex; overflow: hidden;">
+                <div class="text-editor-body">
                     // Line numbers
-                    <div style="width: 50px; background-color: #1e1e1e; border-right: 1px solid #333; overflow: hidden; padding-top: 12px;">
-                        <div style={format!("font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: {}px; line-height: 1.6; color: #858585; text-align: right; padding-right: 8px; user-select: none;", self.font_size)}>
+                    <div class="text-editor-gutter">
+                        <div class="text-editor-linenumbers" style={format!("font-size: {}px;", self.font_size)}>
                             {
                                 (1..=self.line_count).map(|n| {
                                     let is_current = n == self.cursor_line;
                                     html! {
-                                        <div style={format!("color: {};", if is_current { "#d4d4d4" } else { "#858585" })}>
+                                        <div class={classes!("text-editor-linenumber", is_current.then_some("current"))}>
                                             { n }
                                         </div>
                                     }
@@ -249,15 +249,8 @@ impl Component for TextEditor {
                     // Text area
                     <textarea
                         ref={self.textarea_ref.clone()}
-                        style={format!(
-                            "flex: 1; padding: 12px; background-color: #1e1e1e; color: #d4d4d4; \
-                             border: none; outline: none; resize: none; \
-                             font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; \
-                             font-size: {}px; line-height: 1.6; tab-size: 4; \
-                             white-space: {};",
-                            self.font_size,
-                            if self.word_wrap { "pre-wrap" } else { "pre" }
-                        )}
+                        class={classes!("text-editor-textarea", (!self.word_wrap).then_some("nowrap"))}
+                        style={format!("font-size: {}px;", self.font_size)}
                         value={self.content.clone()}
                         {oninput}
                         {onkeydown}
@@ -267,13 +260,13 @@ impl Component for TextEditor {
                 </div>
                 
                 // Status bar
-                <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 12px; background-color: #007acc; color: white; font-size: 12px;">
-                    <div style="display: flex; gap: 16px;">
+                <div class="text-editor-status">
+                    <div class="text-editor-status-group">
                         <span>{ format!("Ln {}, Col {}", self.cursor_line, self.cursor_col) }</span>
                         <span>{ format!("{} lines", self.line_count) }</span>
                         <span>{ format!("{} chars", self.content.len()) }</span>
                     </div>
-                    <div style="display: flex; gap: 16px;">
+                    <div class="text-editor-status-group">
                         <span>{ if self.word_wrap { "Word Wrap: On" } else { "Word Wrap: Off" } }</span>
                         <span>{ "UTF-8" }</span>
                     </div>

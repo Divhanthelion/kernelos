@@ -25,6 +25,8 @@ pub enum SettingsMsg {
 pub struct SettingsProps {
     pub on_theme_change: Callback<String>,
     pub on_wallpaper_change: Callback<String>,
+    #[prop_or_default]
+    pub on_accent_change: Callback<String>,
 }
 
 impl Component for Settings {
@@ -57,7 +59,8 @@ impl Component for Settings {
                 true
             }
             SettingsMsg::SetAccentColor(color) => {
-                self.accent_color = color;
+                self.accent_color = color.clone();
+                ctx.props().on_accent_change.emit(color);
                 true
             }
         }
@@ -65,10 +68,10 @@ impl Component for Settings {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <div class="settings" style="display: flex; height: 100%; background-color: #252526;">
+            <div class="settings">
                 // Sidebar
-                <div style="width: 200px; background-color: #1e1e1e; border-right: 1px solid #333; padding: 12px 0;">
-                    <div style="padding: 12px 16px; color: white; font-size: 16px; font-weight: 600; border-bottom: 1px solid #333; margin-bottom: 8px;">
+                <div class="settings-sidebar">
+                    <div class="settings-sidebar-title">
                         { "⚙️ Settings" }
                     </div>
                     { self.render_nav_item(ctx, "🎨", "Appearance", SettingsTab::Appearance) }
@@ -77,7 +80,7 @@ impl Component for Settings {
                 </div>
                 
                 // Content
-                <div style="flex: 1; padding: 24px; overflow-y: auto;">
+                <div class="settings-content">
                     {
                         match self.active_tab {
                             SettingsTab::Appearance => self.render_appearance_tab(ctx),
@@ -97,16 +100,11 @@ impl Settings {
         let tab_clone = tab.clone();
         
         html! {
-            <div 
-                style={format!(
-                    "display: flex; align-items: center; padding: 12px 16px; cursor: pointer; \
-                     transition: background-color 0.15s ease; {} {}",
-                    if is_active { "background-color: rgba(74, 158, 255, 0.2); border-left: 3px solid #4a9eff;" } else { "border-left: 3px solid transparent;" },
-                    if is_active { "color: white;" } else { "color: #d4d4d4;" }
-                )}
+            <div
+                class={classes!("settings-nav-item", is_active.then_some("active"))}
                 onclick={ctx.link().callback(move |_| SettingsMsg::SetTab(tab_clone.clone()))}
             >
-                <span style="margin-right: 12px;">{ icon }</span>
+                <span class="settings-nav-icon">{ icon }</span>
                 <span>{ label }</span>
             </div>
         }
@@ -115,14 +113,12 @@ impl Settings {
     fn render_appearance_tab(&self, ctx: &Context<Self>) -> Html {
         html! {
             <div>
-                <h2 style="color: white; font-size: 24px; margin: 0 0 24px 0; font-weight: 400;">{ "Appearance" }</h2>
+                <h2 class="settings-heading">{ "Appearance" }</h2>
                 
                 // Theme selection
-                <div style="margin-bottom: 32px;">
-                    <h3 style="color: #d4d4d4; font-size: 14px; margin: 0 0 16px 0; text-transform: uppercase; letter-spacing: 1px;">
-                        { "Theme" }
-                    </h3>
-                    <div style="display: flex; gap: 16px;">
+                <div class="settings-section">
+                    <h3 class="settings-section-title">{ "Theme" }</h3>
+                    <div class="settings-swatch-row">
                         { self.render_theme_option(ctx, "dark", "Dark", "#1a1a2e", "#ffffff") }
                         { self.render_theme_option(ctx, "light", "Light", "#f5f5f5", "#1a1a1a") }
                         { self.render_theme_option(ctx, "midnight", "Midnight", "#0d1117", "#58a6ff") }
@@ -130,11 +126,9 @@ impl Settings {
                 </div>
                 
                 // Accent color
-                <div style="margin-bottom: 32px;">
-                    <h3 style="color: #d4d4d4; font-size: 14px; margin: 0 0 16px 0; text-transform: uppercase; letter-spacing: 1px;">
-                        { "Accent Color" }
-                    </h3>
-                    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                <div class="settings-section">
+                    <h3 class="settings-section-title">{ "Accent Color" }</h3>
+                    <div class="settings-color-row">
                         { self.render_color_option(ctx, "#4a9eff", "Blue") }
                         { self.render_color_option(ctx, "#e94560", "Red") }
                         { self.render_color_option(ctx, "#28ca41", "Green") }
@@ -148,10 +142,8 @@ impl Settings {
                 
                 // Window effects
                 <div>
-                    <h3 style="color: #d4d4d4; font-size: 14px; margin: 0 0 16px 0; text-transform: uppercase; letter-spacing: 1px;">
-                        { "Window Effects" }
-                    </h3>
-                    <div style="background-color: #1e1e1e; border-radius: 8px; overflow: hidden;">
+                    <h3 class="settings-section-title">{ "Window Effects" }</h3>
+                    <div class="settings-toggle-group">
                         { self.render_toggle_option("Transparency effects", true) }
                         { self.render_toggle_option("Window animations", true) }
                         { self.render_toggle_option("Blur effects", true) }
@@ -166,21 +158,15 @@ impl Settings {
         let value_str = value.to_string();
         
         html! {
-            <div 
-                style={format!(
-                    "cursor: pointer; border-radius: 12px; overflow: hidden; \
-                     border: 3px solid {}; transition: all 0.2s ease;",
-                    if is_selected { "#4a9eff" } else { "transparent" }
-                )}
+            <div
+                class={classes!("settings-swatch", is_selected.then_some("selected"))}
                 onclick={ctx.link().callback(move |_| SettingsMsg::SetTheme(value_str.clone()))}
             >
-                <div style={format!("width: 120px; height: 80px; background-color: {}; display: flex; align-items: center; justify-content: center;", bg)}>
-                    <div style={format!("color: {}; font-size: 12px;", fg)}>
-                        { "Aa" }
-                    </div>
+                <div class="settings-swatch-preview" style={format!("background-color: {};", bg)}>
+                    <div style={format!("color: {};", fg)}>{ "Aa" }</div>
                 </div>
-                <div style="padding: 8px; background-color: #2d2d2d; text-align: center;">
-                    <span style="color: #d4d4d4; font-size: 13px;">{ label }</span>
+                <div class="settings-swatch-label">
+                    <span>{ label }</span>
                 </div>
             </div>
         }
@@ -193,13 +179,8 @@ impl Settings {
 
         html! {
             <div
-                style={format!(
-                    "width: 40px; height: 40px; border-radius: 50%; cursor: pointer; \
-                     background-color: {}; border: 3px solid {}; \
-                     transition: transform 0.2s ease; box-shadow: 0 2px 8px rgba(0,0,0,0.3);",
-                    color,
-                    if is_selected { "#ffffff" } else { "transparent" }
-                )}
+                class={classes!("settings-color", is_selected.then_some("selected"))}
+                style={format!("background-color: {};", color)}
                 onclick={ctx.link().callback(move |_| SettingsMsg::SetAccentColor(color_str.clone()))}
                 title={name_str}
             />
@@ -208,19 +189,10 @@ impl Settings {
 
     fn render_toggle_option(&self, label: &str, enabled: bool) -> Html {
         html! {
-            <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px; border-bottom: 1px solid #333;">
-                <span style="color: #d4d4d4; font-size: 14px;">{ label }</span>
-                <div style={format!(
-                    "width: 44px; height: 24px; border-radius: 12px; cursor: pointer; \
-                     background-color: {}; position: relative; transition: background-color 0.2s ease;",
-                    if enabled { "#4a9eff" } else { "#555" }
-                )}>
-                    <div style={format!(
-                        "width: 20px; height: 20px; border-radius: 50%; background-color: white; \
-                         position: absolute; top: 2px; transition: left 0.2s ease; \
-                         left: {}px; box-shadow: 0 2px 4px rgba(0,0,0,0.3);",
-                        if enabled { 22 } else { 2 }
-                    )} />
+            <div class="settings-option">
+                <span class="settings-option-label">{ label }</span>
+                <div class={classes!("settings-toggle", enabled.then_some("on"))}>
+                    <div class="settings-toggle-knob" />
                 </div>
             </div>
         }
@@ -240,29 +212,22 @@ impl Settings {
 
         html! {
             <div>
-                <h2 style="color: white; font-size: 24px; margin: 0 0 24px 0; font-weight: 400;">{ "Wallpaper" }</h2>
+                <h2 class="settings-heading">{ "Wallpaper" }</h2>
                 
-                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px;">
+                <div class="settings-wallpaper-grid">
                     {
                         wallpapers.iter().map(|(id, name, style)| {
                             let is_selected = &self.selected_wallpaper == *id;
                             let id_str = id.to_string();
                             
                             html! {
-                                <div 
-                                    style={format!(
-                                        "cursor: pointer; border-radius: 12px; overflow: hidden; \
-                                         border: 3px solid {}; transition: all 0.2s ease;",
-                                        if is_selected { "#4a9eff" } else { "transparent" }
-                                    )}
+                                <div
+                                    class={classes!("settings-swatch", is_selected.then_some("selected"))}
                                     onclick={ctx.link().callback(move |_| SettingsMsg::SetWallpaper(id_str.clone()))}
                                 >
-                                    <div style={format!(
-                                        "height: 120px; background: {};",
-                                        style
-                                    )} />
-                                    <div style="padding: 12px; background-color: #2d2d2d;">
-                                        <span style="color: #d4d4d4; font-size: 14px;">{ *name }</span>
+                                    <div class="settings-wallpaper-preview" style={format!("background: {};", style)} />
+                                    <div class="settings-swatch-label">
+                                        <span>{ *name }</span>
                                     </div>
                                 </div>
                             }
@@ -275,35 +240,31 @@ impl Settings {
 
     fn render_about_tab(&self) -> Html {
         html! {
-            <div style="text-align: center; padding: 48px 24px;">
-                <div style="font-size: 64px; margin-bottom: 24px;">{ "🖥️" }</div>
-                <h1 style="color: white; font-size: 32px; margin: 0 0 8px 0; font-weight: 300;">
-                    { "KernelOS" }
-                </h1>
-                <p style="color: #888; font-size: 16px; margin: 0 0 32px 0;">
-                    { "Version 2.0.0" }
-                </p>
+            <div class="settings-about">
+                <div class="settings-about-logo">{ "🖥️" }</div>
+                <h1 class="settings-about-title">{ "KernelOS" }</h1>
+                <p class="settings-about-version">{ "Version 2.0.0" }</p>
                 
-                <div style="background-color: #1e1e1e; border-radius: 12px; padding: 24px; max-width: 400px; margin: 0 auto; text-align: left;">
-                    <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333;">
-                        <span style="color: #888;">{ "Built with" }</span>
-                        <span style="color: #d4d4d4;">{ "Rust + Yew + WASM" }</span>
+                <div class="settings-about-table">
+                    <div class="settings-about-row">
+                        <span class="settings-about-key">{ "Built with" }</span>
+                        <span class="settings-about-value">{ "Rust + Yew + WASM" }</span>
                     </div>
-                    <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333;">
-                        <span style="color: #888;">{ "Platform" }</span>
-                        <span style="color: #d4d4d4;">{ "WebAssembly" }</span>
+                    <div class="settings-about-row">
+                        <span class="settings-about-key">{ "Platform" }</span>
+                        <span class="settings-about-value">{ "WebAssembly" }</span>
                     </div>
-                    <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333;">
-                        <span style="color: #888;">{ "Storage" }</span>
-                        <span style="color: #d4d4d4;">{ "LocalStorage VFS" }</span>
+                    <div class="settings-about-row">
+                        <span class="settings-about-key">{ "Storage" }</span>
+                        <span class="settings-about-value">{ "LocalStorage VFS" }</span>
                     </div>
-                    <div style="display: flex; justify-content: space-between; padding: 8px 0;">
-                        <span style="color: #888;">{ "License" }</span>
-                        <span style="color: #d4d4d4;">{ "MIT" }</span>
+                    <div class="settings-about-row last">
+                        <span class="settings-about-key">{ "License" }</span>
+                        <span class="settings-about-value">{ "MIT" }</span>
                     </div>
                 </div>
                 
-                <p style="color: #666; font-size: 12px; margin-top: 32px;">
+                <p class="settings-about-footer">
                     { "A demonstration of modern web technologies." }
                 </p>
             </div>

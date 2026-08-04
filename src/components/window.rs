@@ -1,23 +1,22 @@
 use yew::prelude::*;
-use web_sys::MouseEvent;
+use web_sys::{MouseEvent, PointerEvent};
 use std::rc::Rc;
 use std::cell::RefCell;
-use gloo_timers::callback::Timeout;
 
+use crate::apps::{self, AppContext};
 use crate::filesystem::FileSystem;
-use crate::components::terminal::Terminal;
-use crate::components::file_explorer::FileExplorer;
-use crate::components::text_editor::TextEditor;
-use crate::components::clock::Clock;
-use crate::components::calculator::Calculator;
-use crate::components::settings::Settings;
-use crate::components::paint::Paint;
-use crate::components::minesweeper::Minesweeper;
+use crate::plugin::{self, PluginHandle};
+use crate::plugin::abi::Event;
+use crate::plugin::render::{render_ops, RenderContext};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WindowState {
     pub id: String,
     pub title: String,
+    /// Which registry app this window hosts.
+    pub app_id: String,
+    /// Launch argument for that app — a file path, a URL, or nothing.
+    pub arg: Option<String>,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -27,25 +26,51 @@ pub struct WindowState {
     pub is_minimized: bool,
     pub is_maximized: bool,
     pub is_focused: bool,
-    pub content_type: WindowContentType,
+    /// Stacking order, assigned by the Desktop. Higher is nearer the viewer.
+    pub z_index: u32,
     // Store pre-maximize dimensions
     pub restore_rect: Option<(i32, i32, i32, i32)>,
+    /// Per-window plugin instance. `Some` exactly when `app_id` names a plugin.
+    pub plugin_handle: Option<Rc<RefCell<PluginHandle>>>,
+}
+
+impl PartialEq for WindowState {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.title == other.title
+            && self.app_id == other.app_id
+            && self.arg == other.arg
+            && self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+            && self.min_width == other.min_width
+            && self.min_height == other.min_height
+            && self.is_minimized == other.is_minimized
+            && self.is_maximized == other.is_maximized
+            && self.is_focused == other.is_focused
+            && self.z_index == other.z_index
+            && self.restore_rect == other.restore_rect
+            && match (&self.plugin_handle, &other.plugin_handle) {
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 impl WindowState {
-    pub fn new(id: String, title: String, content_type: WindowContentType) -> Self {
-        let (width, height, min_width, min_height) = match &content_type {
-            WindowContentType::Calculator => (320, 480, 280, 400),
-            WindowContentType::Clock => (300, 200, 200, 150),
-            WindowContentType::Settings { .. } => (700, 500, 500, 400),
-            WindowContentType::Paint => (800, 600, 400, 300),
-            WindowContentType::Minesweeper => (400, 500, 300, 400),
-            _ => (650, 450, 300, 200),
-        };
+    /// Build a window for a registered app. Geometry comes from the registry so
+    /// there is no second place to keep in sync.
+    pub fn new(id: String, app_id: &str, title: String, arg: Option<String>) -> Self {
+        let (width, height, min_width, min_height) = apps::geometry_for(app_id)
+            .unwrap_or((650, 450, 300, 200));
 
         Self {
             id,
             title,
+            app_id: app_id.to_string(),
+            arg,
             x: 100,
             y: 50,
             width,
@@ -55,28 +80,15 @@ impl WindowState {
             is_minimized: false,
             is_maximized: false,
             is_focused: true,
-            content_type,
+            z_index: 0,
             restore_rect: None,
+            plugin_handle: None,
         }
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum WindowContentType {
-    Empty,
-    Terminal,
-    FileExplorer,
-    TextEditor { file_path: Option<String> },
-    Clock,
-    Calculator,
-    Settings { on_theme_change: Callback<String>, on_wallpaper_change: Callback<String> },
-    Paint,
-    Minesweeper,
-    About,
-}
-
 #[derive(Clone, Copy, PartialEq)]
-enum DragMode {
+pub enum DragMode {
     None,
     Move,
     ResizeRight,
@@ -94,6 +106,10 @@ pub struct WindowProps {
     pub on_maximize: Callback<String>,
     pub on_open_file: Callback<(String, String)>,
     pub on_notification: Callback<(String, String, String)>,
+    pub on_theme_change: Callback<String>,
+    pub on_wallpaper_change: Callback<String>,
+    pub on_accent_change: Callback<String>,
+    pub on_geometry_changed: Callback<()>,
 }
 
 pub struct Window {
@@ -108,16 +124,19 @@ pub struct Window {
 }
 
 pub enum WindowMsg {
-    StartMove(i32, i32),
-    StartResizeRight(i32, i32),
-    StartResizeBottom(i32, i32),
-    StartResizeCorner(i32, i32),
+    /// (x, y, pointer_id) — the pointer is captured so the drag survives the
+    /// cursor outrunning the render loop and leaving the element.
+    StartDrag(DragMode, i32, i32, i32),
     Drag(i32, i32),
-    StopDrag,
+    StopDrag(i32),
     Close,
     Minimize,
     Maximize,
     Focus,
+    /// A widget inside a plugin UI fired — deliver it to the guest.
+    PluginEvent(Event),
+    /// The guest crashed; re-instantiate it from the registry.
+    ReloadPlugin,
 }
 
 impl Component for Window {
@@ -139,48 +158,25 @@ impl Component for Window {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            WindowMsg::StartMove(x, y) => {
+            WindowMsg::StartDrag(mode, x, y, pointer_id) => {
+                // Any grab also raises the window.
+                ctx.props().on_focus.emit(ctx.props().window.borrow().id.clone());
+
                 let window = ctx.props().window.borrow();
                 if window.is_maximized {
                     return false;
                 }
-                self.drag_mode = DragMode::Move;
+
+                self.drag_mode = mode;
                 self.drag_start_x = x;
                 self.drag_start_y = y;
                 self.window_start_x = window.x;
                 self.window_start_y = window.y;
-                true
-            }
-            WindowMsg::StartResizeRight(x, y) => {
-                let window = ctx.props().window.borrow();
-                if window.is_maximized {
-                    return false;
-                }
-                self.drag_mode = DragMode::ResizeRight;
-                self.drag_start_x = x;
-                self.window_start_width = window.width;
-                true
-            }
-            WindowMsg::StartResizeBottom(x, y) => {
-                let window = ctx.props().window.borrow();
-                if window.is_maximized {
-                    return false;
-                }
-                self.drag_mode = DragMode::ResizeBottom;
-                self.drag_start_y = y;
-                self.window_start_height = window.height;
-                true
-            }
-            WindowMsg::StartResizeCorner(x, y) => {
-                let window = ctx.props().window.borrow();
-                if window.is_maximized {
-                    return false;
-                }
-                self.drag_mode = DragMode::ResizeCorner;
-                self.drag_start_x = x;
-                self.drag_start_y = y;
                 self.window_start_width = window.width;
                 self.window_start_height = window.height;
+                drop(window);
+
+                self.set_pointer_capture(pointer_id);
                 true
             }
             WindowMsg::Drag(x, y) => {
@@ -214,8 +210,14 @@ impl Component for Window {
                     DragMode::None => false,
                 }
             }
-            WindowMsg::StopDrag => {
+            WindowMsg::StopDrag(pointer_id) => {
+                if self.drag_mode == DragMode::None {
+                    return false;
+                }
                 self.drag_mode = DragMode::None;
+                self.release_pointer_capture(pointer_id);
+                // Persist once per gesture rather than on every pointer move.
+                ctx.props().on_geometry_changed.emit(());
                 true
             }
             WindowMsg::Close => {
@@ -234,6 +236,34 @@ impl Component for Window {
                 ctx.props().on_focus.emit(ctx.props().window.borrow().id.clone());
                 false
             }
+            WindowMsg::PluginEvent(event) => {
+                let handle = ctx.props().window.borrow().plugin_handle.clone();
+                if let Some(handle) = handle {
+                    handle.borrow_mut().send(&event);
+                }
+                // Re-render either way: the guest may have mutated state (or
+                // crashed, which switches the view to the crash screen).
+                true
+            }
+            WindowMsg::ReloadPlugin => {
+                let app_id = ctx.props().window.borrow().app_id.clone();
+                match plugin::instantiate(&app_id, &ctx.props().fs, self.plugin_notify(ctx)) {
+                    Ok(mut handle) => {
+                        let _ = handle.send(&Event::Init);
+                        let handle = Rc::new(RefCell::new(handle));
+                        if let Some(mut window) = ctx.props().window.try_borrow_mut().ok() {
+                            window.plugin_handle = Some(handle);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("plugin reload failed: {e}");
+                        if let Some(handle) = ctx.props().window.borrow().plugin_handle.clone() {
+                            handle.borrow_mut().set_crash(e);
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -248,35 +278,39 @@ impl Component for Window {
             (window.x, window.y, window.width, window.height)
         };
 
+        // Only geometry stays inline — it is per-window and dynamic. Everything
+        // cosmetic lives in styles.css so themes can reach it.
         let window_style = format!(
-            "position: absolute; left: {}px; top: {}px; width: {}px; height: {}px; \
-             z-index: {}; display: {}; border-radius: {}; \
-             overflow: hidden; box-shadow: {};",
-            x, y, width, height,
-            if window.is_focused { 100 } else { 50 },
-            if window.is_minimized { "none" } else { "flex" },
-            if window.is_maximized { "0" } else { "8px" },
-            if window.is_focused { 
-                "0 8px 32px rgba(0, 0, 0, 0.3)" 
-            } else { 
-                "0 4px 16px rgba(0, 0, 0, 0.2)" 
-            }
+            "left: {}px; top: {}px; width: {}px; height: {}px; z-index: {};",
+            x, y, width, height, window.z_index
         );
 
-        let on_titlebar_mousedown = ctx.link().callback(|e: MouseEvent| {
-            e.prevent_default();
-            WindowMsg::StartMove(e.client_x(), e.client_y())
-        });
+        // One grab handler for the titlebar and all three resize handles.
+        let grab = |mode: DragMode| {
+            ctx.link().callback(move |e: PointerEvent| {
+                e.prevent_default();
+                e.stop_propagation();
+                WindowMsg::StartDrag(mode, e.client_x(), e.client_y(), e.pointer_id())
+            })
+        };
 
+        let on_titlebar_pointerdown = grab(DragMode::Move);
         let on_titlebar_dblclick = ctx.link().callback(|_| WindowMsg::Maximize);
 
-        let on_mousemove = ctx.link().callback(|e: MouseEvent| {
+        let on_pointermove = ctx.link().callback(|e: PointerEvent| {
             WindowMsg::Drag(e.client_x(), e.client_y())
         });
 
-        let on_mouseup = ctx.link().callback(|_| WindowMsg::StopDrag);
-        let on_mouseleave = ctx.link().callback(|_| WindowMsg::StopDrag);
-        let on_focus = ctx.link().callback(|_| WindowMsg::Focus);
+        let on_pointerup = ctx.link().callback(|e: PointerEvent| WindowMsg::StopDrag(e.pointer_id()));
+        let on_pointercancel = ctx.link().callback(|e: PointerEvent| WindowMsg::StopDrag(e.pointer_id()));
+
+        // Raise on any press inside the window, and keep the press from reaching
+        // the desktop, whose click handler unfocuses everything.
+        let on_focus = ctx.link().callback(|e: PointerEvent| {
+            e.stop_propagation();
+            WindowMsg::Focus
+        });
+        let swallow_click = Callback::from(|e: MouseEvent| e.stop_propagation());
         let on_close = ctx.link().callback(|e: MouseEvent| {
             e.stop_propagation();
             WindowMsg::Close
@@ -290,69 +324,56 @@ impl Component for Window {
             WindowMsg::Maximize
         });
 
-        let on_resize_right = ctx.link().callback(|e: MouseEvent| {
-            e.prevent_default();
-            e.stop_propagation();
-            WindowMsg::StartResizeRight(e.client_x(), e.client_y())
-        });
-
-        let on_resize_bottom = ctx.link().callback(|e: MouseEvent| {
-            e.prevent_default();
-            e.stop_propagation();
-            WindowMsg::StartResizeBottom(e.client_x(), e.client_y())
-        });
-
-        let on_resize_corner = ctx.link().callback(|e: MouseEvent| {
-            e.prevent_default();
-            e.stop_propagation();
-            WindowMsg::StartResizeCorner(e.client_x(), e.client_y())
-        });
+        let on_resize_right = grab(DragMode::ResizeRight);
+        let on_resize_bottom = grab(DragMode::ResizeBottom);
+        let on_resize_corner = grab(DragMode::ResizeCorner);
 
         let title = window.title.clone();
         let is_maximized = window.is_maximized;
+        let window_is_minimized = window.is_minimized;
         drop(window);
 
         html! {
             <div 
-                class={classes!("window", if ctx.props().window.borrow().is_focused { Some("focused") } else { None })}
+                class={classes!(
+                    "window",
+                    ctx.props().window.borrow().is_focused.then_some("focused"),
+                    window_is_minimized.then_some("minimized"),
+                    is_maximized.then_some("maximized"),
+                )}
                 style={window_style}
-                onclick={on_focus}
-                onmousemove={on_mousemove.clone()}
-                onmouseup={on_mouseup.clone()}
-                onmouseleave={on_mouseleave}
+                onpointerdown={on_focus}
+                onclick={swallow_click}
+                onpointermove={on_pointermove}
+                onpointerup={on_pointerup}
+                onpointercancel={on_pointercancel}
                 ref={self.node_ref.clone()}
             >
-                <div 
+                <div
                     class="window-titlebar"
-                    style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background-color: #3d3d3d; cursor: move; user-select: none;"
-                    onmousedown={on_titlebar_mousedown}
+                    onpointerdown={on_titlebar_pointerdown}
                     ondblclick={on_titlebar_dblclick}
                 >
-                    <span class="window-title" style="font-size: 13px; font-weight: 500; color: white; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                        { &title }
-                    </span>
-                    <div class="window-controls" style="display: flex; gap: 8px;">
-                        <button 
+                    <span class="window-title">{ &title }</span>
+                    <div class="window-controls">
+                        <button
                             class="window-control minimize"
-                            style="width: 12px; height: 12px; border-radius: 50%; border: none; cursor: pointer; background-color: #ffbd2e;"
                             onclick={on_minimize}
                             title="Minimize"
                         />
-                        <button 
+                        <button
                             class="window-control maximize"
-                            style="width: 12px; height: 12px; border-radius: 50%; border: none; cursor: pointer; background-color: #28ca41;"
                             onclick={on_maximize}
                             title={if is_maximized { "Restore" } else { "Maximize" }}
                         />
-                        <button 
+                        <button
                             class="window-control close"
-                            style="width: 12px; height: 12px; border-radius: 50%; border: none; cursor: pointer; background-color: #ff5f57;"
                             onclick={on_close}
                             title="Close"
                         />
                     </div>
                 </div>
-                <div class="window-content" style="flex: 1; overflow: auto; background-color: #2d2d2d;">
+                <div class="window-content">
                     { self.render_content(ctx) }
                 </div>
                 
@@ -361,21 +382,9 @@ impl Component for Window {
                     if !is_maximized {
                         html! {
                             <>
-                                <div 
-                                    class="resize-handle right"
-                                    style="position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: ew-resize;"
-                                    onmousedown={on_resize_right}
-                                />
-                                <div 
-                                    class="resize-handle bottom"
-                                    style="position: absolute; bottom: 0; left: 0; width: 100%; height: 6px; cursor: ns-resize;"
-                                    onmousedown={on_resize_bottom}
-                                />
-                                <div 
-                                    class="resize-handle corner"
-                                    style="position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize;"
-                                    onmousedown={on_resize_corner}
-                                />
+                                <div class="resize-handle right" onpointerdown={on_resize_right} />
+                                <div class="resize-handle bottom" onpointerdown={on_resize_bottom} />
+                                <div class="resize-handle corner" onpointerdown={on_resize_corner} />
                             </>
                         }
                     } else {
@@ -388,57 +397,78 @@ impl Component for Window {
 }
 
 impl Window {
+    /// Route all further events for this pointer to the window root, so a drag
+    /// keeps tracking even when the cursor moves off the element or off-screen.
+    fn set_pointer_capture(&self, pointer_id: i32) {
+        if let Some(element) = self.node_ref.cast::<web_sys::Element>() {
+            let _ = element.set_pointer_capture(pointer_id);
+        }
+    }
+
+    fn release_pointer_capture(&self, pointer_id: i32) {
+        if let Some(element) = self.node_ref.cast::<web_sys::Element>() {
+            let _ = element.release_pointer_capture(pointer_id);
+        }
+    }
+
     fn render_content(&self, ctx: &Context<Self>) -> Html {
         let window = ctx.props().window.borrow();
-        let fs = Rc::clone(&ctx.props().fs);
-        let on_open_file = ctx.props().on_open_file.clone();
-        let on_notification = ctx.props().on_notification.clone();
-        
-        match &window.content_type {
-            WindowContentType::Empty => html! {
-                <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #888;">
-                    { "Empty Window" }
-                </div>
-            },
-            WindowContentType::Terminal => {
-                html! { <Terminal fs={fs} on_notification={on_notification} /> }
-            }
-            WindowContentType::FileExplorer => {
-                html! { <FileExplorer fs={fs} on_open_file={on_open_file} /> }
-            }
-            WindowContentType::TextEditor { file_path } => {
-                html! { <TextEditor fs={fs} file_path={file_path.clone()} on_notification={on_notification} /> }
-            }
-            WindowContentType::Clock => {
-                html! { <Clock /> }
-            }
-            WindowContentType::Calculator => {
-                html! { <Calculator /> }
-            }
-            WindowContentType::Settings { on_theme_change, on_wallpaper_change } => {
-                html! { <Settings on_theme_change={on_theme_change.clone()} on_wallpaper_change={on_wallpaper_change.clone()} /> }
-            }
-            WindowContentType::Paint => {
-                html! { <Paint /> }
-            }
-            WindowContentType::Minesweeper => {
-                html! { <Minesweeper /> }
-            }
-            WindowContentType::About => {
-                html! {
-                    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: white; text-align: center; padding: 24px;">
-                        <div style="font-size: 48px; margin-bottom: 16px;">{ "🖥️" }</div>
-                        <h1 style="margin: 0 0 8px 0; font-weight: 300;">{ "KernelOS" }</h1>
-                        <p style="color: rgba(255,255,255,0.7); margin: 0 0 24px 0;">{ "Version 2.0" }</p>
-                        <p style="color: rgba(255,255,255,0.5); font-size: 13px; max-width: 300px;">
-                            { "A WebAssembly-based desktop environment built with Rust and Yew." }
-                        </p>
-                        <p style="color: rgba(255,255,255,0.4); font-size: 12px; margin-top: 24px;">
-                            { "© 2025 KernelOS Project" }
-                        </p>
-                    </div>
-                }
-            }
+
+        // Plugin windows carry their own instance — render its current frame.
+        if let Some(handle) = window.plugin_handle.clone() {
+            return self.render_plugin(ctx, handle);
         }
+
+        let Some(app) = apps::find(&window.app_id) else {
+            return html! {
+                <div class="window-missing-app">
+                    { format!("Unknown application '{}'", window.app_id) }
+                </div>
+            };
+        };
+
+        let context = AppContext {
+            fs: Rc::clone(&ctx.props().fs),
+            arg: window.arg.clone(),
+            on_open_file: ctx.props().on_open_file.clone(),
+            on_notification: ctx.props().on_notification.clone(),
+            on_theme_change: ctx.props().on_theme_change.clone(),
+            on_wallpaper_change: ctx.props().on_wallpaper_change.clone(),
+            on_accent_change: ctx.props().on_accent_change.clone(),
+        };
+
+        (app.render)(&context)
+    }
+
+    fn render_plugin(&self, ctx: &Context<Self>, handle: Rc<RefCell<PluginHandle>>) -> Html {
+        let handle = handle.borrow();
+
+        if let Some(message) = handle.crash_message() {
+            let on_reload = ctx.link().callback(|_| WindowMsg::ReloadPlugin);
+            let message = message.to_string();
+            return html! {
+                <div class="plugin-crash">
+                    <div class="plugin-crash-icon">{ "💥" }</div>
+                    <div class="plugin-crash-title">{ "This app crashed" }</div>
+                    <div class="plugin-crash-message">{ message }</div>
+                    <button class="plugin-crash-reload" onclick={on_reload}>
+                        { "Reload" }
+                    </button>
+                </div>
+            };
+        }
+
+        let on_event = ctx.link().callback(WindowMsg::PluginEvent);
+        let render_ctx = RenderContext { on_event };
+        render_ops(handle.ops(), &render_ctx)
+    }
+
+    /// Map Desktop's `(title, body, kind)` notification callback down to the
+    /// `(title, body)` pair the plugin host import expects.
+    fn plugin_notify(&self, ctx: &Context<Self>) -> Callback<(String, String)> {
+        let cb = ctx.props().on_notification.clone();
+        Callback::from(move |(title, body): (String, String)| {
+            cb.emit((title, body, "info".to_string()));
+        })
     }
 }

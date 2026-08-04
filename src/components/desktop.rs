@@ -4,8 +4,11 @@ use std::cell::RefCell;
 use web_sys::MouseEvent;
 use wasm_bindgen::JsCast;
 
+use crate::apps;
+use crate::plugin;
 use crate::filesystem::FileSystem;
-use crate::components::window::{Window, WindowState, WindowContentType};
+use crate::session::{Session, SessionWindow, ThemeConfig};
+use crate::components::window::{Window, WindowState};
 use crate::components::taskbar::{Taskbar, TaskbarWindow};
 use crate::components::start_menu::StartMenu;
 use crate::components::context_menu::{ContextMenu, get_desktop_context_menu};
@@ -15,16 +18,18 @@ pub struct Desktop {
     fs: Rc<RefCell<FileSystem>>,
     windows: Vec<Rc<RefCell<WindowState>>>,
     next_window_id: u32,
+    /// Monotonic counter handing out stacking order; the newest raise wins.
+    next_z_index: u32,
     start_menu_visible: bool,
     context_menu: Option<(i32, i32)>,
     notifications: NotificationManager,
     theme: String,
+    accent: String,
     wallpaper: String,
 }
 
 pub enum DesktopMsg {
     // Window management
-    OpenWindow(WindowContentType, String),
     CloseWindow(String),
     FocusWindow(String),
     MinimizeWindow(String),
@@ -51,46 +56,92 @@ pub enum DesktopMsg {
     ShowNotification(String, String, String),
     DismissNotification(u32),
     
+    /// A drag or resize finished; persist the new geometry.
+    WindowGeometryChanged,
+
     // Settings
     SetTheme(String),
+    SetAccent(String),
     SetWallpaper(String),
+
+    /// A bundled plugin finished loading in the background; re-render so the
+    /// menus, icons and quick launch pick up the new entry.
+    PluginsChanged,
 }
 
 impl Component for Desktop {
     type Message = DesktopMsg;
     type Properties = ();
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
         let fs = Rc::new(RefCell::new(FileSystem::default()));
-        
-        Self {
+
+        let config = ThemeConfig::load(&fs.borrow());
+        let session = Session::load(&fs.borrow());
+
+        // Plugin notifications arrive as (title, body); Desktop adds the kind.
+        let on_plugin_notify = {
+            let link = ctx.link().clone();
+            Callback::from(move |(title, body): (String, String)| {
+                link.send_message(DesktopMsg::ShowNotification(title, body, "info".to_string()));
+            })
+        };
+        let on_plugins_changed = ctx.link().callback(|_| DesktopMsg::PluginsChanged);
+
+        let mut desktop = Self {
             fs,
             windows: Vec::new(),
             next_window_id: 1,
+            next_z_index: 1,
             start_menu_visible: false,
             context_menu: None,
             notifications: NotificationManager::new(),
-            theme: "dark".to_string(),
-            wallpaper: "gradient1".to_string(),
+            theme: config.theme,
+            accent: config.accent,
+            wallpaper: config.wallpaper,
+        };
+
+        // Load installed plugins synchronously, fetch bundled ones in the
+        // background (they register and then Desktop re-renders).
+        plugin::init(
+            Rc::clone(&desktop.fs),
+            on_plugin_notify.clone(),
+            on_plugins_changed,
+        );
+
+        desktop.restore_session(session, &on_plugin_notify);
+        desktop
+    }
+
+    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            self.apply_theme_to_document();
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            DesktopMsg::OpenWindow(content_type, title) => {
-                self.create_window(content_type, title, ctx);
-                true
-            }
             DesktopMsg::CloseWindow(id) => {
                 self.windows.retain(|w| w.borrow().id != id);
+                self.save_session();
                 true
             }
             DesktopMsg::FocusWindow(id) => {
+                let already_on_top = self.windows.iter().any(|w| {
+                    let w = w.borrow();
+                    w.id == id && w.is_focused && !w.is_minimized
+                });
+                if already_on_top {
+                    return false;
+                }
+
+                let z = self.take_z_index();
                 for window in &self.windows {
                     let mut w = window.borrow_mut();
                     w.is_focused = w.id == id;
-                    if w.id == id && w.is_minimized {
+                    if w.id == id {
                         w.is_minimized = false;
+                        w.z_index = z;
                     }
                 }
                 true
@@ -103,6 +154,7 @@ impl Component for Desktop {
                         w.is_focused = false;
                     }
                 }
+                self.save_session();
                 true
             }
             DesktopMsg::MaximizeWindow(id) => {
@@ -125,6 +177,7 @@ impl Component for Desktop {
                         }
                     }
                 }
+                self.save_session();
                 true
             }
             DesktopMsg::ToggleStartMenu => {
@@ -172,11 +225,7 @@ impl Component for Desktop {
             }
             DesktopMsg::OpenFile(path, _file_type) => {
                 let title = path.rsplit('/').next().unwrap_or("File").to_string();
-                self.create_window(
-                    WindowContentType::TextEditor { file_path: Some(path) },
-                    title,
-                    ctx
-                );
+                self.create_window("text-editor", title, Some(path));
                 true
             }
             DesktopMsg::ShowNotification(title, message, notification_type) => {
@@ -195,10 +244,30 @@ impl Component for Desktop {
             }
             DesktopMsg::SetTheme(theme) => {
                 self.theme = theme;
+                self.apply_theme_to_document();
+                self.save_theme_config();
+                true
+            }
+            DesktopMsg::SetAccent(color) => {
+                self.accent = color;
+                self.apply_theme_to_document();
+                self.save_theme_config();
                 true
             }
             DesktopMsg::SetWallpaper(wallpaper) => {
                 self.wallpaper = wallpaper;
+                self.save_theme_config();
+                true
+            }
+            DesktopMsg::WindowGeometryChanged => {
+                // Fired once when a drag or resize ends, not per frame.
+                self.save_session();
+                false
+            }
+            DesktopMsg::PluginsChanged => {
+                // A bundled plugin finished loading in the background; menus,
+                // icons and quick launch all read the registry fresh each
+                // render, so a re-render is all that is needed.
                 true
             }
         }
@@ -216,7 +285,7 @@ impl Component for Desktop {
                 TaskbarWindow {
                     id: w.id.clone(),
                     title: w.title.clone(),
-                    icon: self.get_window_icon(&w.content_type),
+                    icon: apps::icon_for(&w.app_id).to_string(),
                     is_minimized: w.is_minimized,
                     is_focused: w.is_focused,
                 }
@@ -224,24 +293,20 @@ impl Component for Desktop {
             .collect();
 
         html! {
-            <div 
+            <div
                 class="desktop"
-                style={format!(
-                    "position: relative; width: 100vw; height: 100vh; overflow: hidden; {}",
-                    wallpaper_style
-                )}
+                style={wallpaper_style}
                 onclick={on_desktop_click}
                 oncontextmenu={on_context_menu}
             >
                 // Desktop icons
-                <div style="position: absolute; top: 16px; left: 16px; display: flex; flex-direction: column; gap: 8px;">
-                    { self.render_desktop_icon(ctx, "📁", "Files", "file-explorer") }
-                    { self.render_desktop_icon(ctx, "💻", "Terminal", "terminal") }
-                    { self.render_desktop_icon(ctx, "📝", "Notes", "text-editor") }
-                    { self.render_desktop_icon(ctx, "🔢", "Calculator", "calculator") }
-                    { self.render_desktop_icon(ctx, "🎨", "Paint", "paint") }
-                    { self.render_desktop_icon(ctx, "💣", "Minesweeper", "minesweeper") }
-                    { self.render_desktop_icon(ctx, "⚙️", "Settings", "settings") }
+                <div class="desktop-icons">
+                    {
+                        apps::all_apps().into_iter()
+                            .filter(|app| app.on_desktop)
+                            .map(|app| self.render_desktop_icon(ctx, &app.icon, &app.title, &app.id))
+                            .collect::<Html>()
+                    }
                 </div>
                 
                 // Windows
@@ -272,6 +337,10 @@ impl Component for Desktop {
                                 {on_maximize}
                                 {on_open_file}
                                 {on_notification}
+                                on_theme_change={ctx.link().callback(DesktopMsg::SetTheme)}
+                                on_wallpaper_change={ctx.link().callback(DesktopMsg::SetWallpaper)}
+                                on_accent_change={ctx.link().callback(DesktopMsg::SetAccent)}
+                                on_geometry_changed={ctx.link().callback(|_| DesktopMsg::WindowGeometryChanged)}
                             />
                         }
                     }).collect::<Html>()
@@ -320,56 +389,213 @@ impl Component for Desktop {
 }
 
 impl Desktop {
-    fn create_window(&mut self, content_type: WindowContentType, title: String, ctx: &Context<Self>) {
+    fn restore_session(&mut self, session: Session, on_plugin_notify: &Callback<(String, String)>) {
+        for saved in session.windows {
+            // Drop windows whose app has since left the registry rather than
+            // resurrecting an unopenable shell. Plugins that are still
+            // installed come back with a fresh per-window instance.
+            if apps::find(&saved.app_id).is_none() {
+                if plugin::is_installed(&saved.app_id) {
+                    self.restore_plugin_window(&saved, on_plugin_notify);
+                }
+                continue;
+            }
+
+            let id = format!("window-{}", self.next_window_id);
+            self.next_window_id += 1;
+            let z_index = self.take_z_index();
+
+            let mut window = WindowState::new(id, &saved.app_id, saved.title, saved.arg);
+            window.x = saved.x;
+            window.y = saved.y;
+            window.width = saved.width;
+            window.height = saved.height;
+            window.is_maximized = saved.is_maximized;
+            window.is_minimized = saved.is_minimized;
+            window.is_focused = false;
+            window.z_index = z_index;
+            if saved.is_maximized {
+                window.restore_rect = Some((saved.x, saved.y, saved.width, saved.height));
+            }
+
+            self.windows.push(Rc::new(RefCell::new(window)));
+        }
+
+        // Focus the topmost restored window so the desktop comes back usable.
+        if let Some(last) = self.windows.last() {
+            last.borrow_mut().is_focused = true;
+        }
+    }
+
+    /// Restore one plugin-backed window: re-instantiate the guest and rebuild
+    /// the `WindowState` with the saved geometry. A failed instantiation logs
+    /// and drops the window rather than showing a dead shell.
+    fn restore_plugin_window(
+        &mut self,
+        saved: &SessionWindow,
+        on_plugin_notify: &Callback<(String, String)>,
+    ) {
+        match plugin::instantiate(&saved.app_id, &self.fs, on_plugin_notify.clone()) {
+            Ok(handle) => {
+                let id = format!("window-{}", self.next_window_id);
+                self.next_window_id += 1;
+                let z_index = self.take_z_index();
+
+                let mut window = WindowState::new(
+                    id,
+                    &saved.app_id,
+                    saved.title.clone(),
+                    saved.arg.clone(),
+                );
+                window.x = saved.x;
+                window.y = saved.y;
+                window.width = saved.width;
+                window.height = saved.height;
+                window.is_maximized = saved.is_maximized;
+                window.is_minimized = saved.is_minimized;
+                window.is_focused = false;
+                window.z_index = z_index;
+                window.plugin_handle = Some(Rc::new(RefCell::new(handle)));
+                if saved.is_maximized {
+                    window.restore_rect = Some((saved.x, saved.y, saved.width, saved.height));
+                }
+
+                self.windows.push(Rc::new(RefCell::new(window)));
+            }
+            Err(e) => {
+                log::warn!("plugin '{}' failed to restore: {e}", saved.app_id);
+            }
+        }
+    }
+
+    fn save_session(&self) {
+        let session = Session {
+            windows: self.windows.iter().map(|window| {
+                let w = window.borrow();
+                SessionWindow {
+                    app_id: w.app_id.clone(),
+                    arg: w.arg.clone(),
+                    title: w.title.clone(),
+                    // Persist the pre-maximize rect so restoring a maximized
+                    // window still knows where to un-maximize to.
+                    x: w.restore_rect.map(|r| r.0).unwrap_or(w.x),
+                    y: w.restore_rect.map(|r| r.1).unwrap_or(w.y),
+                    width: w.restore_rect.map(|r| r.2).unwrap_or(w.width),
+                    height: w.restore_rect.map(|r| r.3).unwrap_or(w.height),
+                    is_maximized: w.is_maximized,
+                    is_minimized: w.is_minimized,
+                }
+            }).collect(),
+        };
+
+        session.save(&mut self.fs.borrow_mut());
+    }
+
+    fn save_theme_config(&self) {
+        let config = ThemeConfig {
+            theme: self.theme.clone(),
+            accent: self.accent.clone(),
+            wallpaper: self.wallpaper.clone(),
+        };
+        config.save(&mut self.fs.borrow_mut());
+    }
+
+    /// Push the theme onto the document root. `styles.css` keys its whole light
+    /// palette off `[data-theme="light"]`, and every component colour reads from
+    /// these variables, so this one attribute is what makes the theme real.
+    fn apply_theme_to_document(&self) {
+        let Some(root) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        else {
+            return;
+        };
+
+        let _ = root.set_attribute("data-theme", &self.theme);
+
+        if let Some(root) = root.dyn_ref::<web_sys::HtmlElement>() {
+            let _ = root.style().set_property("--accent-primary", &self.accent);
+        }
+    }
+
+    fn take_z_index(&mut self) -> u32 {
+        let z = self.next_z_index;
+        self.next_z_index += 1;
+        z
+    }
+
+    fn create_window(&mut self, app_id: &str, title: String, arg: Option<String>) {
         let id = format!("window-{}", self.next_window_id);
         self.next_window_id += 1;
-        
+        let z_index = self.take_z_index();
+
         // Unfocus all existing windows
         for window in &self.windows {
             window.borrow_mut().is_focused = false;
         }
-        
+
         // Offset new windows
         let offset = (self.windows.len() as i32 % 10) * 30;
-        
-        let content_type = match content_type {
-            WindowContentType::Settings { .. } => {
-                WindowContentType::Settings {
-                    on_theme_change: ctx.link().callback(DesktopMsg::SetTheme),
-                    on_wallpaper_change: ctx.link().callback(DesktopMsg::SetWallpaper),
-                }
-            }
-            other => other,
-        };
-        
-        let mut window = WindowState::new(id, title, content_type);
+
+        let mut window = WindowState::new(id, app_id, title, arg);
         window.x += offset;
         window.y += offset;
-        
+        window.z_index = z_index;
+
         self.windows.push(Rc::new(RefCell::new(window)));
+        self.save_session();
     }
-    
+
     fn launch_app(&mut self, app_id: &str, ctx: &Context<Self>) {
-        let (content_type, title) = match app_id {
-            "file-explorer" => (WindowContentType::FileExplorer, "File Explorer"),
-            "terminal" => (WindowContentType::Terminal, "Terminal"),
-            "text-editor" => (WindowContentType::TextEditor { file_path: None }, "Text Editor"),
-            "calculator" => (WindowContentType::Calculator, "Calculator"),
-            "clock" => (WindowContentType::Clock, "Clock"),
-            "paint" => (WindowContentType::Paint, "Paint"),
-            "minesweeper" => (WindowContentType::Minesweeper, "Minesweeper"),
-            "settings" => (
-                WindowContentType::Settings { 
-                    on_theme_change: ctx.link().callback(DesktopMsg::SetTheme),
-                    on_wallpaper_change: ctx.link().callback(DesktopMsg::SetWallpaper),
-                },
-                "Settings"
-            ),
-            "about" => (WindowContentType::About, "About KernelOS"),
-            _ => return,
+        if let Some(app) = apps::find(app_id) {
+            self.create_window(app.id, app.title.to_string(), None);
+            return;
+        }
+        // Runtime-registered plugin: spin up a fresh per-window instance.
+        if plugin::is_installed(app_id) {
+            self.launch_plugin_window(app_id, ctx);
+        }
+    }
+
+    /// Open a window for an installed plugin, instantiating its WASM module.
+    fn launch_plugin_window(&mut self, app_id: &str, ctx: &Context<Self>) {
+        let Some(info) = plugin::manifest(app_id) else {
+            return;
         };
-        
-        self.create_window(content_type, title.to_string(), ctx);
+        // Plugin notifications arrive as (title, body); the desktop adds the kind.
+        let on_notify = {
+            let link = ctx.link().clone();
+            Callback::from(move |(title, body): (String, String)| {
+                link.send_message(DesktopMsg::ShowNotification(title, body, "info".to_string()));
+            })
+        };
+
+        match plugin::instantiate(app_id, &self.fs, on_notify) {
+            Ok(handle) => {
+                let id = format!("window-{}", self.next_window_id);
+                self.next_window_id += 1;
+                let z_index = self.take_z_index();
+
+                // Unfocus all existing windows
+                for window in &self.windows {
+                    window.borrow_mut().is_focused = false;
+                }
+
+                let offset = (self.windows.len() as i32 % 10) * 30;
+                let mut window = WindowState::new(id, app_id, info.name, None);
+                window.x += offset;
+                window.y += offset;
+                window.z_index = z_index;
+                window.plugin_handle = Some(Rc::new(RefCell::new(handle)));
+
+                self.windows.push(Rc::new(RefCell::new(window)));
+                self.save_session();
+            }
+            Err(e) => {
+                self.notifications
+                    .add("Plugin Error".to_string(), e, NotificationType::Error);
+            }
+        }
     }
     
     fn handle_context_menu_action(&mut self, action: &str, ctx: &Context<Self>) {
@@ -434,42 +660,12 @@ impl Desktop {
             DesktopMsg::LaunchApp(app_id_str.clone())
         });
         
+        // Hover styling is CSS (.desktop-icon:hover), not hand-rolled JS.
         html! {
-            <div 
-                style="display: flex; flex-direction: column; align-items: center; padding: 8px; \
-                       border-radius: 8px; cursor: pointer; width: 80px; transition: background-color 0.2s ease;"
-                ondblclick={on_dblclick}
-                onmouseover={Callback::from(|e: MouseEvent| {
-                    if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
-                        let _ = el.style().set_property("background-color", "rgba(255,255,255,0.1)");
-                    }
-                })}
-                onmouseout={Callback::from(|e: MouseEvent| {
-                    if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
-                        let _ = el.style().set_property("background-color", "transparent");
-                    }
-                })}
-            >
-                <span style="font-size: 36px; margin-bottom: 4px;">{ icon }</span>
-                <span style="color: white; font-size: 11px; text-align: center; text-shadow: 1px 1px 2px rgba(0,0,0,0.8); word-wrap: break-word; max-width: 70px;">
-                    { label }
-                </span>
+            <div class="desktop-icon" ondblclick={on_dblclick}>
+                <span class="desktop-icon-image">{ icon }</span>
+                <span class="desktop-icon-label">{ label }</span>
             </div>
-        }
-    }
-    
-    fn get_window_icon(&self, content_type: &WindowContentType) -> String {
-        match content_type {
-            WindowContentType::FileExplorer => "📁".to_string(),
-            WindowContentType::Terminal => "💻".to_string(),
-            WindowContentType::TextEditor { .. } => "📝".to_string(),
-            WindowContentType::Calculator => "🔢".to_string(),
-            WindowContentType::Clock => "🕐".to_string(),
-            WindowContentType::Paint => "🎨".to_string(),
-            WindowContentType::Minesweeper => "💣".to_string(),
-            WindowContentType::Settings { .. } => "⚙️".to_string(),
-            WindowContentType::About => "ℹ️".to_string(),
-            WindowContentType::Empty => "📄".to_string(),
         }
     }
     

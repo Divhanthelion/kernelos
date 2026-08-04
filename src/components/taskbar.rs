@@ -1,6 +1,8 @@
 use yew::prelude::*;
 use gloo_timers::callback::Interval;
 
+use crate::apps;
+
 #[derive(Clone, PartialEq)]
 pub struct TaskbarWindow {
     pub id: String,
@@ -60,59 +62,53 @@ impl Component for Taskbar {
         let on_start_click = ctx.props().on_start_click.clone();
 
         html! {
-            <div class="taskbar" style="position: fixed; bottom: 0; left: 0; right: 0; height: 48px; background-color: rgba(30,30,30,0.95); backdrop-filter: blur(20px); display: flex; align-items: center; padding: 0 8px; z-index: 1000; border-top: 1px solid rgba(255,255,255,0.1);">
+            <div class="taskbar">
                 // Start Button
-                <button 
+                <button
                     class="start-button"
-                    style="width: 40px; height: 40px; border-radius: 8px; border: none; background: linear-gradient(135deg, #4a9eff, #e94560); color: white; font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center;"
-                    onclick={Callback::from(move |_| on_start_click.emit(()))}
+                    onclick={Callback::from(move |e: MouseEvent| {
+                        // Without this the click reaches the desktop, whose
+                        // handler closes the menu we just opened.
+                        e.stop_propagation();
+                        on_start_click.emit(())
+                    })}
                     title="Start Menu"
                 >
                     { "⊞" }
                 </button>
 
                 // Quick Launch
-                <div class="quick-launch" style="display: flex; gap: 4px; margin-left: 12px; padding-left: 12px; border-left: 1px solid rgba(255,255,255,0.1);">
-                    { self.render_quick_launch_button(ctx, "file-explorer", "📁", "File Explorer") }
-                    { self.render_quick_launch_button(ctx, "terminal", "💻", "Terminal") }
-                    { self.render_quick_launch_button(ctx, "text-editor", "📝", "Text Editor") }
-                    { self.render_quick_launch_button(ctx, "calculator", "🔢", "Calculator") }
+                <div class="quick-launch">
+                    {
+                        apps::all_apps().iter()
+                            .filter(|app| app.in_quick_launch)
+                            .map(|app| self.render_quick_launch_button(ctx, &app.id, &app.icon, &app.title))
+                            .collect::<Html>()
+                    }
                 </div>
 
                 // Window Buttons
-                <div class="taskbar-windows" style="display: flex; gap: 4px; margin-left: 12px; flex: 1; overflow-x: auto;">
+                <div class="taskbar-windows">
                     {
                         ctx.props().windows.iter().map(|window| {
                             let window_id = window.id.clone();
                             let on_click = ctx.props().on_window_click.clone();
                             
-                            let button_style = format!(
-                                "height: 36px; padding: 0 12px; border-radius: 6px; border: none; \
-                                 background: {}; color: white; font-size: 12px; cursor: pointer; \
-                                 display: flex; align-items: center; gap: 8px; white-space: nowrap; \
-                                 max-width: 180px; overflow: hidden; text-overflow: ellipsis; {}",
-                                if window.is_focused { 
-                                    "rgba(255,255,255,0.2)" 
-                                } else if window.is_minimized {
-                                    "rgba(255,255,255,0.05)"
-                                } else {
-                                    "rgba(255,255,255,0.1)"
-                                },
-                                if window.is_focused {
-                                    "border-bottom: 2px solid #4a9eff;"
-                                } else {
-                                    ""
-                                }
-                            );
-                            
                             html! {
-                                <button 
-                                    style={button_style}
-                                    onclick={Callback::from(move |_| on_click.emit(window_id.clone()))}
+                                <button
+                                    class={classes!(
+                                        "taskbar-window-button",
+                                        window.is_focused.then_some("active"),
+                                        window.is_minimized.then_some("minimized"),
+                                    )}
+                                    onclick={Callback::from(move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        on_click.emit(window_id.clone())
+                                    })}
                                     title={window.title.clone()}
                                 >
                                     <span>{ &window.icon }</span>
-                                    <span style="overflow: hidden; text-overflow: ellipsis;">{ &window.title }</span>
+                                    <span class="taskbar-window-title">{ &window.title }</span>
                                 </button>
                             }
                         }).collect::<Html>()
@@ -120,12 +116,12 @@ impl Component for Taskbar {
                 </div>
 
                 // System Tray
-                <div class="system-tray" style="display: flex; align-items: center; gap: 12px; margin-left: auto; padding-left: 12px; border-left: 1px solid rgba(255,255,255,0.1);">
-                    <div style="display: flex; flex-direction: column; align-items: flex-end; padding: 0 8px;">
-                        <span style="color: white; font-size: 12px; font-weight: 500;">
+                <div class="system-tray">
+                    <div class="system-tray-clock">
+                        <span class="system-tray-time">
                             { &self.current_time }
                         </span>
-                        <span style="color: rgba(255,255,255,0.6); font-size: 10px;">
+                        <span class="system-tray-date">
                             { &self.current_date }
                         </span>
                     </div>
@@ -161,9 +157,12 @@ impl Taskbar {
         let on_click = ctx.props().on_quick_launch.clone();
         
         html! {
-            <button 
-                style="width: 36px; height: 36px; border-radius: 6px; border: none; background: transparent; color: white; font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center;"
-                onclick={Callback::from(move |_| on_click.emit(app_id.clone()))}
+            <button
+                class="quick-launch-button"
+                onclick={Callback::from(move |e: MouseEvent| {
+                    e.stop_propagation();
+                    on_click.emit(app_id.clone())
+                })}
                 title={title.to_string()}
             >
                 { icon }

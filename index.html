@@ -79,6 +79,8 @@
         <div class="loading-text">KernelOS</div>
         <div class="loading-subtitle">Loading system components...</div>
     </div>
+    <!-- Plugin bundles, served at /plugins/ so `pkg install <id>` can fetch them. -->
+    <link data-trunk rel="copy-dir" href="assets/plugins" />
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
     <script>
         // Hide loading screen once WASM is ready

@@ -2,10 +2,12 @@
 // Built with Rust and Yew
 
 pub mod filesystem;
+pub mod apps;
+pub mod session;
+pub mod plugin;
 pub mod components;
 
 use wasm_bindgen::prelude::*;
-use yew::prelude::*;
 use components::Desktop;
 
 #[wasm_bindgen(start)]

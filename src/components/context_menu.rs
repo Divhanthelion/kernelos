@@ -151,7 +151,7 @@ impl Component for ContextMenu {
         html! {
             <>
                 <div 
-                    style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1999;"
+                    class="context-menu-backdrop"
                     onclick={on_overlay_click}
                     oncontextmenu={ctx.link().callback(|e: MouseEvent| {
                         e.prevent_default();
@@ -201,23 +201,21 @@ impl ContextMenu {
 
                         html! {
                             <>
-                                <div 
-                                    class="context-menu-item"
-                                    style={format!(
-                                        "display: flex; align-items: center; padding: 10px 16px; cursor: pointer; \
-                                         color: white; font-size: 13px; transition: background-color 0.15s ease; \
-                                         position: relative; {}",
-                                        if is_active { "background-color: rgba(74,158,255,0.3);" } else { "" }
+                                <div
+                                    class={classes!(
+                                        "context-menu-item",
+                                        "context-menu-submenu",
+                                        is_active.then_some("active"),
                                     )}
                                     onclick={on_click}
                                     onmouseenter={on_mouse_enter}
                                 >
-                                    <span style="margin-right: 12px; font-size: 16px; width: 20px;">{ &item.icon }</span>
-                                    <span style="flex: 1;">{ &item.label }</span>
+                                    <span class="context-menu-item-icon">{ &item.icon }</span>
+                                    <span class="context-menu-item-label">{ &item.label }</span>
                                     {
                                         if let Some(shortcut) = &item.shortcut {
                                             html! {
-                                                <span style="color: rgba(255,255,255,0.4); font-size: 11px; margin-left: 16px;">
+                                                <span class="context-menu-shortcut">
                                                     { shortcut }
                                                 </span>
                                             }
@@ -228,7 +226,7 @@ impl ContextMenu {
                                     {
                                         if has_submenu {
                                             html! {
-                                                <span style="margin-left: 8px; font-size: 10px; color: rgba(255,255,255,0.5);">{ "▶" }</span>
+                                                <span class="context-menu-arrow">{ "▶" }</span>
                                             }
                                         } else {
                                             html! {}
@@ -238,7 +236,7 @@ impl ContextMenu {
                                         if is_active {
                                             if let Some(submenu) = &item.submenu {
                                                 html! {
-                                                    <div style="position: absolute; left: 100%; top: 0; min-width: 180px; background-color: #2d2d2d; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); padding: 8px 0; border: 1px solid rgba(255,255,255,0.1);">
+                                                    <div class="context-menu-submenu-panel">
                                                         {
                                                             submenu.iter().map(|sub_item| {
                                                                 let sub_id = sub_item.id.clone();
@@ -248,12 +246,11 @@ impl ContextMenu {
                                                                 });
                                                                 
                                                                 html! {
-                                                                    <div 
+                                                                    <div
                                                                         class="context-menu-item"
-                                                                        style="display: flex; align-items: center; padding: 10px 16px; cursor: pointer; color: white; font-size: 13px;"
                                                                         onclick={on_sub_click}
                                                                     >
-                                                                        <span style="margin-right: 12px; font-size: 16px;">{ &sub_item.icon }</span>
+                                                                        <span class="context-menu-item-icon">{ &sub_item.icon }</span>
                                                                         <span>{ &sub_item.label }</span>
                                                                     </div>
                                                                 }
@@ -272,7 +269,7 @@ impl ContextMenu {
                                 {
                                     if item.divider_after {
                                         html! {
-                                            <div style="height: 1px; background-color: rgba(255,255,255,0.1); margin: 4px 0;" />
+                                            <div class="context-menu-separator" />
                                         }
                                     } else {
                                         html! {}

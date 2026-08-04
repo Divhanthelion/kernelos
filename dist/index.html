@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>KernelOS v2</title>
-    <link rel="stylesheet" href="./styles-5b4fe08b701d4b0d.css" integrity="sha384-9NdquVx5KHN0zYwT5slucaHUwLEik2aG9qCqrUdPwdJpnz2fv3IuGPdPQi+3C/VI"./>
+    <link rel="stylesheet" href="/styles-7f87460e3eb92fd8.css" integrity="sha384-Bi/l1emRLXJkQOl6kx/73y56LboHzAoUmSxxBk99k8cQra0BVTH55ofofctr5eqI"/>
     <style>
         * {
             margin: 0;
@@ -72,17 +72,19 @@
             font-size: 0.9em;
         }
     </style>
-<link rel="modulepreload" href="./kernelosv2-772aa7be8ece93b1.js" crossorigin="anonymous" integrity="sha384-moapJJpfg1KWlnI2qr657DxS5gyR3fnMxb5l6O2BW+wgnpe1aXDx0hWrRUGdNQ3n"><link rel="preload" href="./kernelosv2-772aa7be8ece93b1_bg.wasm" crossorigin="anonymous" integrity="sha384-i71e3m7euwEWESPcsUYnzCJjTq9eJKOUQMxBd7DiOsCiAPNKIUrrFYHfDUiwybs2" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/kernelosv2-3026d11ee459fbec.js" crossorigin="anonymous" integrity="sha384-xs1axSY03PaOGS//x0YumcrPKw5aWuqUsU1XeMyOmYy2pE//MzWS+lTHWgdN68t8"><link rel="preload" href="/kernelosv2-3026d11ee459fbec_bg.wasm" crossorigin="anonymous" integrity="sha384-tpVD2Nf9V4WXUcx0cl6OP6jr+6oxwzCvSqaopWWMGRu0+KmonVWUggwwMtyM4OcI" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="loader"></div>
         <div class="loading-text">KernelOS</div>
         <div class="loading-subtitle">Loading system components...</div>
     </div>
+    <!-- Plugin bundles, served at /plugins/ so `pkg install <id>` can fetch them. -->
+    
     
 <script type="module">
-import init, * as bindings from '/kernelosv2-772aa7be8ece93b1.js';
-const wasm = await init({ module_or_path: '/kernelosv2-772aa7be8ece93b1_bg.wasm' });
+import init, * as bindings from '/kernelosv2-3026d11ee459fbec.js';
+const wasm = await init({ module_or_path: '/kernelosv2-3026d11ee459fbec_bg.wasm' });
 
 
 window.wasmBindings = bindings;

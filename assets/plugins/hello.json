@@ -1,0 +1,14 @@
+{
+  "id": "hello",
+  "name": "Hello Plugin",
+  "icon": "👋",
+  "abi_version": 1,
+  "requests": [{ "cap": "notify" }],
+  "category": "Plugins",
+  "on_desktop": true,
+  "in_quick_launch": true,
+  "width": 360,
+  "height": 280,
+  "min_width": 240,
+  "min_height": 180
+}

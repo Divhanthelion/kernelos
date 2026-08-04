@@ -51,11 +51,11 @@ impl Component for Clock {
         let second_rotation = self.seconds as f64 * 6.0;
 
         html! {
-            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); padding: 24px;">
+            <div class="clock-widget">
                 // Analog clock
-                <div style="position: relative; width: 180px; height: 180px; margin-bottom: 24px;">
+                <div class="clock-face">
                     // Clock face
-                    <svg viewBox="0 0 200 200" style="width: 100%; height: 100%;">
+                    <svg viewBox="0 0 200 200" class="clock-svg">
                         // Outer ring gradient
                         <defs>
                             <linearGradient id="clockGradient" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -133,14 +133,14 @@ impl Component for Clock {
                 </div>
                 
                 // Digital time
-                <div style="text-align: center;">
-                    <div style="font-size: 48px; font-weight: 200; color: white; letter-spacing: 4px; font-family: 'Segoe UI', sans-serif;">
+                <div class="clock-readout">
+                    <div class="clock-time">
                         { format!("{:02}:{:02}:{:02}", self.hours, self.minutes, self.seconds) }
                     </div>
-                    <div style="font-size: 16px; color: rgba(255,255,255,0.6); margin-top: 8px; letter-spacing: 2px;">
+                    <div class="clock-date">
                         { &self.day_name }
                     </div>
-                    <div style="font-size: 14px; color: rgba(255,255,255,0.4); margin-top: 4px;">
+                    <div class="clock-zone">
                         { &self.date_string }
                     </div>
                 </div>

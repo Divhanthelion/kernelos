@@ -8,10 +8,14 @@ description = "A WebAssembly-based desktop environment"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-yew = { version = "0.21", features = ["csr"] }
+yew = { version = "0.23", features = ["csr"] }
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
 web-sys = { version = "0.3", features = [
     "Window",
+    "Location",
     "Document",
     "Element",
     "HtmlElement",
@@ -20,6 +24,7 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
     "MouseEvent",
+    "PointerEvent",
     "KeyboardEvent",
     "InputEvent",
     "Event",
@@ -43,10 +48,9 @@ wasm-logger = "0.2"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-gloo-timers = "0.3"
-gloo-events = "0.2"
-rand = { version = "0.8", features = ["small_rng"] }
-getrandom = { version = "0.2", features = ["js"] }
+gloo-timers = "0.4"
+rand = "0.10"
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [profile.release]
 opt-level = "s"

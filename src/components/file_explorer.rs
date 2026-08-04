@@ -206,36 +206,36 @@ impl Component for FileExplorer {
             .collect();
 
         html! {
-            <div class="file-explorer" style="display: flex; flex-direction: column; height: 100%; background-color: #252526;">
+            <div class="file-explorer">
                 // Toolbar
-                <div style="display: flex; align-items: center; padding: 8px; gap: 8px; border-bottom: 1px solid #333; background-color: #2d2d2d;">
+                <div class="file-explorer-toolbar">
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer;"
+                        class="btn btn-secondary"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::NavigateUp)}
                     >
                         { "↑ Up" }
                     </button>
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer;"
+                        class="btn btn-secondary"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::Refresh)}
                     >
                         { "⟳" }
                     </button>
-                    <div style="flex: 1;" />
+                    <div class="file-explorer-spacer" />
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #4a9eff; color: white; cursor: pointer;"
+                        class="btn btn-primary"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::CreateNewFile)}
                     >
                         { "+ File" }
                     </button>
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #4a9eff; color: white; cursor: pointer;"
+                        class="btn btn-primary"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::CreateNewDirectory)}
                     >
                         { "+ Folder" }
                     </button>
                     <button 
-                        style="padding: 6px 12px; border: none; border-radius: 4px; background-color: #3c3c3c; color: white; cursor: pointer;"
+                        class="btn btn-secondary"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::ToggleViewMode)}
                     >
                         { if self.view_mode == ViewMode::List { "☷" } else { "☰" } }
@@ -243,9 +243,9 @@ impl Component for FileExplorer {
                 </div>
                 
                 // Path bar
-                <div style="display: flex; align-items: center; padding: 8px; background-color: #3c3c3c; gap: 4px;">
+                <div class="file-explorer-path">
                     <button 
-                        style="padding: 4px 8px; border: none; border-radius: 4px; background-color: transparent; color: #4a9eff; cursor: pointer;"
+                        class="file-explorer-path-segment"
                         onclick={ctx.link().callback(|_| FileExplorerMsg::NavigateTo("/".to_string()))}
                     >
                         { "/" }
@@ -255,9 +255,9 @@ impl Component for FileExplorer {
                             let path = format!("/{}", path_parts[0..=i].join("/"));
                             html! {
                                 <>
-                                    <span style="color: #666;">{ "›" }</span>
+                                    <span class="file-explorer-path-separator">{ "›" }</span>
                                     <button 
-                                        style="padding: 4px 8px; border: none; border-radius: 4px; background-color: transparent; color: #4a9eff; cursor: pointer;"
+                                        class="file-explorer-path-segment"
                                         onclick={ctx.link().callback(move |_| FileExplorerMsg::NavigateTo(path.clone()))}
                                     >
                                         { part }
@@ -272,10 +272,10 @@ impl Component for FileExplorer {
                 {
                     if let Some(error) = &self.error_message {
                         html! {
-                            <div style="padding: 8px; background-color: #5a1d1d; color: #ff6b6b; display: flex; justify-content: space-between; align-items: center;">
+                            <div class="file-explorer-error">
                                 <span>{ error }</span>
                                 <button 
-                                    style="background: none; border: none; color: #ff6b6b; cursor: pointer;"
+                                    class="file-explorer-error-dismiss"
                                     onclick={ctx.link().callback(|_| FileExplorerMsg::ClearError)}
                                 >
                                     { "×" }
@@ -288,7 +288,7 @@ impl Component for FileExplorer {
                 }
                 
                 // File list
-                <div style="flex: 1; overflow-y: auto; padding: 8px;">
+                <div class="file-explorer-content">
                     {
                         if self.view_mode == ViewMode::List {
                             self.render_list_view(ctx)
@@ -299,7 +299,7 @@ impl Component for FileExplorer {
                 </div>
                 
                 // Status bar
-                <div style="padding: 8px; border-top: 1px solid #333; background-color: #2d2d2d; color: #888; font-size: 12px;">
+                <div class="file-explorer-status">
                     { format!("{} items", self.files.len()) }
                     {
                         if let Some(selected) = &self.selected_file {
@@ -341,19 +341,19 @@ impl FileExplorer {
 
     fn render_list_view(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <table style="width: 100%; border-collapse: collapse;">
+            <table class="file-table">
                 <thead>
-                    <tr style="color: #888; font-size: 12px; text-align: left;">
-                        <th style="padding: 8px; cursor: pointer;" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Name))}>
+                    <tr class="file-table-head">
+                        <th class="sortable" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Name))}>
                             { "Name" } { self.sort_indicator(SortBy::Name) }
                         </th>
-                        <th style="padding: 8px; width: 100px; cursor: pointer;" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Size))}>
+                        <th class="sortable col-size" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Size))}>
                             { "Size" } { self.sort_indicator(SortBy::Size) }
                         </th>
-                        <th style="padding: 8px; width: 150px; cursor: pointer;" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Modified))}>
+                        <th class="sortable col-modified" onclick={ctx.link().callback(|_| FileExplorerMsg::SortBy(SortBy::Modified))}>
                             { "Modified" } { self.sort_indicator(SortBy::Modified) }
                         </th>
-                        <th style="padding: 8px; width: 80px;">{ "" }</th>
+                        <th class="col-actions">{ "" }</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -385,23 +385,20 @@ impl FileExplorer {
                             );
                             
                             html! {
-                                <tr 
-                                    style={format!(
-                                        "cursor: pointer; {}",
-                                        if is_selected { "background-color: rgba(74, 158, 255, 0.2);" } else { "" }
-                                    )}
+                                <tr
+                                    class={classes!("file-row", is_selected.then_some("selected"))}
                                     onclick={ctx.link().callback(move |_| FileExplorerMsg::SelectFile(name.clone()))}
                                     ondblclick={ctx.link().callback(move |_| FileExplorerMsg::OpenFile(name2.clone()))}
                                 >
-                                    <td style="padding: 8px; color: #d4d4d4;">
-                                        <span style="margin-right: 8px;">{ icon }</span>
+                                    <td class="file-cell-name">
+                                        <span class="file-cell-icon">{ icon }</span>
                                         { &file.name }
                                     </td>
-                                    <td style="padding: 8px; color: #888;">{ size_str }</td>
-                                    <td style="padding: 8px; color: #888;">{ date_str }</td>
-                                    <td style="padding: 8px;">
+                                    <td class="file-cell-meta">{ size_str }</td>
+                                    <td class="file-cell-meta">{ date_str }</td>
+                                    <td class="file-cell-actions">
                                         <button 
-                                            style="padding: 4px 8px; border: none; border-radius: 4px; background-color: #5a1d1d; color: #ff6b6b; cursor: pointer; font-size: 11px;"
+                                            class="btn btn-danger btn-small"
                                             onclick={ctx.link().callback(move |e: MouseEvent| {
                                                 e.stop_propagation();
                                                 FileExplorerMsg::DeleteFile(name3.clone())
@@ -421,7 +418,7 @@ impl FileExplorer {
 
     fn render_grid_view(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 16px; padding: 8px;">
+            <div class="file-grid">
                 {
                     self.files.iter().map(|file| {
                         let name = file.name.clone();
@@ -434,16 +431,13 @@ impl FileExplorer {
                         };
                         
                         html! {
-                            <div 
-                                style={format!(
-                                    "display: flex; flex-direction: column; align-items: center; padding: 12px; border-radius: 8px; cursor: pointer; {}",
-                                    if is_selected { "background-color: rgba(74, 158, 255, 0.2);" } else { "" }
-                                )}
+                            <div
+                                class={classes!("file-grid-item", is_selected.then_some("selected"))}
                                 onclick={ctx.link().callback(move |_| FileExplorerMsg::SelectFile(name.clone()))}
                                 ondblclick={ctx.link().callback(move |_| FileExplorerMsg::OpenFile(name2.clone()))}
                             >
-                                <span style="font-size: 48px; margin-bottom: 8px;">{ icon }</span>
-                                <span style="color: #d4d4d4; font-size: 12px; text-align: center; word-break: break-word; max-width: 90px;">
+                                <span class="file-grid-icon">{ icon }</span>
+                                <span class="file-grid-label">
                                     { &file.name }
                                 </span>
                             </div>

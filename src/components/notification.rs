@@ -85,7 +85,7 @@ impl Component for NotificationContainer {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <div class="notification-container" style="position: fixed; top: 16px; right: 16px; z-index: 3000; display: flex; flex-direction: column; gap: 8px;">
+            <div class="notification-container">
                 {
                     ctx.props().notifications.iter().map(|notification| {
                         let id = notification.id;
@@ -165,30 +165,17 @@ impl Component for NotificationItem {
         let notification = &ctx.props().notification;
         let on_dismiss = ctx.link().callback(|_| NotificationItemMsg::Dismiss);
         
-        let style = format!(
-            "position: relative; background-color: #2d2d2d; border-radius: 8px; \
-             box-shadow: 0 4px 16px rgba(0,0,0,0.3); padding: 16px; min-width: 300px; max-width: 400px; \
-             animation: slideIn 0.3s ease; border-left: 4px solid {};",
-            ctx.props().border_color
-        );
-        
+        // Only the accent stripe is dynamic; the rest is themed by CSS.
+        let accent = format!("border-left-color: {};", ctx.props().border_color);
+
         html! {
-            <div class="notification" style={style}>
-                <button 
-                    style="position: absolute; top: 8px; right: 8px; background: none; border: none; color: rgba(255,255,255,0.5); cursor: pointer; font-size: 16px;"
-                    onclick={on_dismiss}
-                >
-                    { "×" }
-                </button>
-                <div style="display: flex; align-items: flex-start; gap: 12px;">
-                    <span style="font-size: 20px;">{ &ctx.props().icon }</span>
+            <div class="notification" style={accent}>
+                <button class="notification-close" onclick={on_dismiss}>{ "×" }</button>
+                <div class="notification-body">
+                    <span class="notification-icon">{ &ctx.props().icon }</span>
                     <div>
-                        <div class="notification-title" style="color: white; font-weight: 600; margin-bottom: 4px;">
-                            { &notification.title }
-                        </div>
-                        <div class="notification-message" style="color: rgba(255,255,255,0.7); font-size: 13px;">
-                            { &notification.message }
-                        </div>
+                        <div class="notification-title">{ &notification.title }</div>
+                        <div class="notification-message">{ &notification.message }</div>
                     </div>
                 </div>
             </div>

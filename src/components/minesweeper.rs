@@ -1,5 +1,5 @@
 use yew::prelude::*;
-use rand::prelude::*;
+use rand::RngExt;
 use web_sys::MouseEvent;
 
 const GRID_SIZE: usize = 10;
@@ -134,17 +134,17 @@ impl Component for Minesweeper {
         };
 
         html! {
-            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 24px;">
+            <div class="game-container">
                 // Header
-                <div style="display: flex; align-items: center; justify-content: space-between; width: 100%; max-width: 340px; margin-bottom: 16px; background-color: #2d2d2d; border-radius: 8px; padding: 12px 16px;">
+                <div class="game-header">
                     // Mines counter
-                    <div style="background-color: #1a1a1a; padding: 8px 12px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 24px; color: #ff0000; min-width: 60px; text-align: center;">
+                    <div class="game-score">
                         { format!("{:03}", self.flags_remaining.max(0)) }
                     </div>
                     
                     // New game button
                     <button 
-                        style="font-size: 32px; background: none; border: none; cursor: pointer; padding: 4px;"
+                        class="game-reset"
                         onclick={ctx.link().callback(|_| MinesweeperMsg::NewGame)}
                         title="New Game"
                     >
@@ -152,17 +152,14 @@ impl Component for Minesweeper {
                     </button>
                     
                     // Timer
-                    <div style="background-color: #1a1a1a; padding: 8px 12px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 24px; color: #ff0000; min-width: 60px; text-align: center;">
+                    <div class="game-score">
                         { format!("{:03}", self.time_elapsed.min(999)) }
                     </div>
                 </div>
                 
                 // Game board
-                <div style="background-color: #2d2d2d; border-radius: 8px; padding: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);">
-                    <div style={format!(
-                        "display: grid; grid-template-columns: repeat({}, 1fr); gap: 2px; background-color: #1a1a1a; padding: 2px; border-radius: 4px;",
-                        GRID_SIZE
-                    )}>
+                <div class="game-board-frame">
+                    <div class="game-board" style={format!("grid-template-columns: repeat({}, 1fr);", GRID_SIZE)}>
                         {
                             (0..GRID_SIZE).map(|row| {
                                 (0..GRID_SIZE).map(|col| {
@@ -174,7 +171,7 @@ impl Component for Minesweeper {
                 </div>
                 
                 // Instructions
-                <div style="margin-top: 16px; color: rgba(255,255,255,0.5); font-size: 12px; text-align: center;">
+                <div class="game-controls">
                     { "Left click to reveal • Right click to flag" }
                 </div>
                 
@@ -182,7 +179,7 @@ impl Component for Minesweeper {
                 {
                     if self.game_state != GameState::Playing {
                         html! {
-                            <div style="margin-top: 16px; padding: 12px 24px; border-radius: 8px; background-color: rgba(0,0,0,0.5); color: white; font-size: 18px;">
+                            <div class="game-banner">
                                 {
                                     match self.game_state {
                                         GameState::Won => "🎉 You Win!",
@@ -211,12 +208,12 @@ impl Minesweeper {
         }
         
         // Place mines
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut mines_placed = 0;
-        
+
         while mines_placed < MINE_COUNT {
-            let row = rng.gen_range(0..GRID_SIZE);
-            let col = rng.gen_range(0..GRID_SIZE);
+            let row = rng.random_range(0..GRID_SIZE);
+            let col = rng.random_range(0..GRID_SIZE);
             
             // Don't place mine on the safe cell or if already a mine
             if let Some((safe_row, safe_col)) = safe_cell {
@@ -340,31 +337,21 @@ impl Minesweeper {
     fn render_cell(&self, ctx: &Context<Self>, row: usize, col: usize) -> Html {
         let cell = &self.grid[row][col];
         
-        let (content, bg_color, text_color) = match cell.state {
-            CellState::Hidden => {
-                ("".to_string(), "#4a4a4a", "#ffffff")
-            }
-            CellState::Flagged => {
-                ("🚩".to_string(), "#4a4a4a", "#ffffff")
-            }
+        // Appearance is carried by classes; the adjacency digit picks a
+        // `.game-cell.n1`..`.n8` colour defined in styles.css.
+        let (content, state_class) = match cell.state {
+            CellState::Hidden => (String::new(), "hidden".to_string()),
+            CellState::Flagged => ("🚩".to_string(), "flagged".to_string()),
             CellState::Revealed => {
                 if cell.is_mine {
-                    ("💣".to_string(), "#e94560", "#ffffff")
+                    ("💣".to_string(), "mine".to_string())
                 } else if cell.adjacent_mines > 0 {
-                    let color = match cell.adjacent_mines {
-                        1 => "#4a9eff",
-                        2 => "#28ca41",
-                        3 => "#e94560",
-                        4 => "#9b59b6",
-                        5 => "#e67e22",
-                        6 => "#1abc9c",
-                        7 => "#2c3e50",
-                        8 => "#7f8c8d",
-                        _ => "#ffffff",
-                    };
-                    (cell.adjacent_mines.to_string(), "#2d2d2d", color)
+                    (
+                        cell.adjacent_mines.to_string(),
+                        format!("revealed n{}", cell.adjacent_mines),
+                    )
                 } else {
-                    ("".to_string(), "#2d2d2d", "#ffffff")
+                    (String::new(), "revealed".to_string())
                 }
             }
         };
@@ -373,14 +360,8 @@ impl Minesweeper {
         let on_context_menu = ctx.link().callback(move |e: MouseEvent| MinesweeperMsg::RightClick(row, col, e));
 
         html! {
-            <div 
-                style={format!(
-                    "width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; \
-                     font-size: 14px; font-weight: bold; cursor: pointer; border-radius: 2px; \
-                     background-color: {}; color: {}; user-select: none; \
-                     transition: background-color 0.1s ease;",
-                    bg_color, text_color
-                )}
+            <div
+                class={classes!("game-cell", state_class)}
                 onclick={on_click}
                 oncontextmenu={on_context_menu}
             >

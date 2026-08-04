@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct Terminal {
     fs: Rc<RefCell<FileSystem>>,
     current_directory: String,
+    /// Where `cd -` returns to.
+    previous_directory: String,
     command_history: Vec<String>,
     history_index: Option<usize>,
     output_lines: Vec<TerminalLine>,
@@ -30,6 +32,9 @@ pub enum TerminalMsg {
     ExecuteCommand,
     KeyDown(KeyboardEvent),
     Clear,
+    /// Async command result (e.g. `pkg install`) appended to the output.
+    Output(String),
+    Error(String),
 }
 
 #[derive(Properties, Clone, PartialEq)]
@@ -47,6 +52,7 @@ impl Component for Terminal {
         let mut terminal = Self {
             fs: Rc::clone(&ctx.props().fs),
             current_directory: "/home".to_string(),
+            previous_directory: "/home".to_string(),
             command_history: Vec::new(),
             history_index: None,
             output_lines: Vec::new(),
@@ -133,6 +139,14 @@ impl Component for Terminal {
                 self.output_lines.clear();
                 true
             }
+            TerminalMsg::Output(text) => {
+                self.output_lines.push(TerminalLine::Output(text));
+                true
+            }
+            TerminalMsg::Error(text) => {
+                self.output_lines.push(TerminalLine::Error(text));
+                true
+            }
         }
     }
 
@@ -147,10 +161,9 @@ impl Component for Terminal {
         let prompt = self.get_prompt();
 
         html! {
-            <div class="terminal" style="height: 100%; display: flex; flex-direction: column; background-color: #1e1e1e; font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;">
-                <div 
-                    class="terminal-output" 
-                    style="flex: 1; overflow-y: auto; padding: 12px; white-space: pre-wrap; word-break: break-word;"
+            <div class="terminal">
+                <div
+                    class="terminal-output"
                     onclick={ctx.link().callback(|_| {
                         // Focus input when clicking terminal
                         TerminalMsg::InputChanged(String::new())
@@ -161,36 +174,36 @@ impl Component for Terminal {
                             match line {
                                 TerminalLine::Command { prompt, command } => {
                                     html! {
-                                        <div style="margin: 2px 0;">
-                                            <span style="color: #4ec9b0;">{ prompt }</span>
-                                            <span style="color: #dcdcdc;">{ command }</span>
+                                        <div class="terminal-line-command">
+                                            <span class="terminal-prompt">{ prompt }</span>
+                                            <span class="terminal-command">{ command }</span>
                                         </div>
                                     }
                                 }
                                 TerminalLine::Output(text) => {
                                     html! {
-                                        <div style="color: #d4d4d4; margin: 2px 0;">{ text }</div>
+                                        <div class="terminal-line-output">{ text }</div>
                                     }
                                 }
                                 TerminalLine::Error(text) => {
                                     html! {
-                                        <div style="color: #f14c4c; margin: 2px 0;">{ text }</div>
+                                        <div class="terminal-line-error">{ text }</div>
                                     }
                                 }
                                 TerminalLine::Success(text) => {
                                     html! {
-                                        <div style="color: #4ec9b0; margin: 2px 0;">{ text }</div>
+                                        <div class="terminal-line-success">{ text }</div>
                                     }
                                 }
                             }
                         }).collect::<Html>()
                     }
                 </div>
-                <div class="terminal-input-line" style="display: flex; align-items: center; padding: 8px 12px; border-top: 1px solid #333; background-color: #252526;">
-                    <span style="color: #4ec9b0; margin-right: 8px; font-size: 13px; white-space: nowrap;">{ &prompt }</span>
+                <div class="terminal-input-line">
+                    <span class="terminal-prompt">{ &prompt }</span>
                     <input 
                         type="text"
-                        style="flex: 1; background: transparent; border: none; outline: none; color: #d4d4d4; font-family: inherit; font-size: 13px;"
+                        class="terminal-input"
                         value={self.current_input.clone()}
                         ref={self.input_ref.clone()}
                         {oninput}
@@ -277,6 +290,7 @@ impl Terminal {
             "grep" => self.cmd_grep(&parts),
             "find" => self.cmd_find(&parts),
             "env" => self.cmd_env(),
+            "pkg" => self.cmd_pkg(&parts, ctx),
             "exit" | "quit" => {
                 self.output_lines.push(TerminalLine::Output(
                     "Use the window close button to exit.".to_string()
@@ -285,6 +299,96 @@ impl Terminal {
             _ => {
                 self.output_lines.push(TerminalLine::Error(
                     format!("Command not found: {}. Type 'help' for available commands.", parts[0])
+                ));
+            }
+        }
+    }
+
+    /// Plugin package manager: `pkg install <id|url>`, `pkg list`, `pkg remove <id>`.
+    /// Install fetches the manifest + wasm, verifies them, stores them in the
+    /// VFS and registers the plugin (plan M8).
+    fn cmd_pkg(&mut self, parts: &[&str], ctx: &Context<Self>) {
+        match parts.get(1).copied().unwrap_or("") {
+            "install" => {
+                let Some(spec) = parts.get(2) else {
+                    self.output_lines.push(TerminalLine::Error(
+                        "usage: pkg install <id|url>".to_string(),
+                    ));
+                    return;
+                };
+                let spec = spec.to_string();
+                self.output_lines.push(TerminalLine::Output(format!(
+                    "Installing '{spec}'..."
+                )));
+
+                let fs = Rc::clone(&self.fs);
+                let on_notify = {
+                    let cb = ctx.props().on_notification.clone();
+                    Callback::from(move |(title, body): (String, String)| {
+                        cb.emit((title, body, "info".to_string()));
+                    })
+                };
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let (manifest_url, wasm_url) = if spec.contains("://") {
+                        let wasm_url = format!("{}.wasm", spec.trim_end_matches(".json"));
+                        (spec.clone(), wasm_url)
+                    } else {
+                        (
+                            format!("/plugins/{spec}.json"),
+                            format!("/plugins/{spec}.wasm"),
+                        )
+                    };
+                    match crate::plugin::install_from_url(
+                        &fs,
+                        &manifest_url,
+                        &wasm_url,
+                        on_notify,
+                    )
+                    .await
+                    {
+                        Ok(()) => link.send_message(TerminalMsg::Output(format!(
+                            "Installed '{spec}'."
+                        ))),
+                        Err(e) => link.send_message(TerminalMsg::Error(format!(
+                            "pkg install: {e}"
+                        ))),
+                    }
+                });
+            }
+            "list" => {
+                let installed = crate::plugin::apps();
+                if installed.is_empty() {
+                    self.output_lines
+                        .push(TerminalLine::Output("No plugins installed.".to_string()));
+                } else {
+                    for app in installed {
+                        self.output_lines.push(TerminalLine::Output(format!(
+                            "{} — {} ({})",
+                            app.id, app.name, app.category
+                        )));
+                    }
+                }
+            }
+            "remove" => {
+                let Some(id) = parts.get(2) else {
+                    self.output_lines.push(TerminalLine::Error(
+                        "usage: pkg remove <id>".to_string(),
+                    ));
+                    return;
+                };
+                match crate::plugin::uninstall(id, &self.fs) {
+                    Ok(()) => self.output_lines.push(TerminalLine::Success(format!(
+                        "Removed '{id}'."
+                    ))),
+                    Err(e) => self
+                        .output_lines
+                        .push(TerminalLine::Error(format!("pkg remove: {e}"))),
+                }
+            }
+            _ => {
+                self.output_lines.push(TerminalLine::Output(
+                    "Usage: pkg install <id|url> | pkg list | pkg remove <id>".to_string(),
                 ));
             }
         }
@@ -331,20 +435,20 @@ impl Terminal {
     }
 
     fn cmd_cd(&mut self, parts: &[&str]) {
+        // `..` needs no special case now that resolve_path canonicalizes.
         let target = match parts.get(1) {
-            Some(&"~") | None => "/home".to_string(),
-            Some(&"-") => "/home".to_string(), // Simplified: go home
-            Some(&"..") => {
-                Path::new(&self.current_directory)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "/".to_string())
-            }
+            None => "/home".to_string(),
+            Some(&"-") => self.previous_directory.clone(),
             Some(path) => self.resolve_path(path),
         };
+
+        let departing_from = self.current_directory.clone();
         
         match self.fs.borrow().list_directory(&target) {
-            Ok(_) => self.current_directory = target,
+            Ok(_) => {
+                self.current_directory = target;
+                self.previous_directory = departing_from;
+            }
             Err(e) => self.output_lines.push(TerminalLine::Error(format!("cd: {}", e))),
         }
     }
@@ -792,17 +896,19 @@ impl Terminal {
         }
     }
 
+    /// Expand `~`, anchor relative paths to the working directory, and collapse
+    /// `.`/`..` so every command sees a canonical absolute path.
     fn resolve_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
+        let joined = if path.starts_with('/') {
             path.to_string()
-        } else if path.starts_with('~') {
-            format!("/home{}", &path[1..])
+        } else if path == "~" {
+            "/home".to_string()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            format!("/home/{}", rest)
         } else {
-            if self.current_directory == "/" {
-                format!("/{}", path)
-            } else {
-                format!("{}/{}", self.current_directory, path)
-            }
-        }
+            format!("{}/{}", self.current_directory, path)
+        };
+
+        FileSystem::normalize_path(&joined)
     }
 }

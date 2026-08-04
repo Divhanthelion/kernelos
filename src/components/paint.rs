@@ -147,11 +147,11 @@ impl Component for Paint {
         ];
 
         html! {
-            <div class="paint" style="display: flex; flex-direction: column; height: 100%; background-color: #f0f0f0;">
+            <div class="paint">
                 // Toolbar
-                <div style="display: flex; align-items: center; padding: 8px; gap: 8px; background-color: #e0e0e0; border-bottom: 1px solid #ccc; flex-wrap: wrap;">
+                <div class="paint-toolbar">
                     // Tools
-                    <div style="display: flex; gap: 4px; padding-right: 12px; border-right: 1px solid #ccc;">
+                    <div class="paint-toolgroup">
                         { self.render_tool_button(ctx, Tool::Brush, "✏️", "Brush") }
                         { self.render_tool_button(ctx, Tool::Eraser, "🧽", "Eraser") }
                         { self.render_tool_button(ctx, Tool::Line, "📏", "Line") }
@@ -160,19 +160,15 @@ impl Component for Paint {
                     </div>
                     
                     // Colors
-                    <div style="display: flex; gap: 4px; padding-right: 12px; border-right: 1px solid #ccc;">
+                    <div class="paint-toolgroup">
                         {
                             colors.iter().map(|color| {
                                 let c = color.to_string();
                                 let is_selected = &self.current_color == *color;
                                 html! {
-                                    <div 
-                                        style={format!(
-                                            "width: 24px; height: 24px; border-radius: 4px; cursor: pointer; \
-                                             background-color: {}; border: 2px solid {};",
-                                            color,
-                                            if is_selected { "#333" } else { "#ccc" }
-                                        )}
+                                    <div
+                                        class={classes!("paint-color", is_selected.then_some("active"))}
+                                        style={format!("background-color: {};", color)}
                                         onclick={ctx.link().callback(move |_| PaintMsg::SetColor(c.clone()))}
                                     />
                                 }
@@ -181,35 +177,26 @@ impl Component for Paint {
                     </div>
                     
                     // Current color display
-                    <div style="display: flex; align-items: center; gap: 8px; padding-right: 12px; border-right: 1px solid #ccc;">
-                        <span style="font-size: 12px; color: #666;">{ "Color:" }</span>
-                        <div style={format!(
-                            "width: 32px; height: 32px; border-radius: 4px; background-color: {}; border: 2px solid #333;",
-                            self.current_color
-                        )} />
+                    <div class="paint-toolgroup">
+                        <span class="paint-label">{ "Color:" }</span>
+                        <div class="paint-current-color" style={format!("background-color: {};", self.current_color)} />
                     </div>
                     
                     // Brush size
-                    <div style="display: flex; align-items: center; gap: 8px; padding-right: 12px; border-right: 1px solid #ccc;">
-                        <span style="font-size: 12px; color: #666;">{ "Size:" }</span>
+                    <div class="paint-toolgroup">
+                        <span class="paint-label">{ "Size:" }</span>
                         {
                             [2u32, 5, 10, 20, 40].iter().map(|size| {
                                 let s = *size;
                                 let is_selected = self.brush_size == s;
                                 html! {
-                                    <button 
-                                        style={format!(
-                                            "width: 32px; height: 32px; border-radius: 4px; cursor: pointer; \
-                                             border: 2px solid {}; background-color: white; \
-                                             display: flex; align-items: center; justify-content: center;",
-                                            if is_selected { "#4a9eff" } else { "#ccc" }
-                                        )}
+                                    <button
+                                        class={classes!("paint-size", is_selected.then_some("active"))}
                                         onclick={ctx.link().callback(move |_| PaintMsg::SetBrushSize(s))}
                                     >
-                                        <div style={format!(
-                                            "width: {}px; height: {}px; border-radius: 50%; background-color: #333;",
-                                            (s as f64 * 0.6).min(20.0) as u32,
-                                            (s as f64 * 0.6).min(20.0) as u32
+                                        <div class="paint-size-dot" style={format!(
+                                            "width: {p}px; height: {p}px;",
+                                            p = (s as f64 * 0.6).min(20.0) as u32
                                         )} />
                                     </button>
                                 }
@@ -218,9 +205,9 @@ impl Component for Paint {
                     </div>
                     
                     // Actions
-                    <div style="display: flex; gap: 4px; margin-left: auto;">
+                    <div class="paint-toolgroup end">
                         <button 
-                            style="padding: 8px 16px; border: none; border-radius: 4px; background-color: #ff5f57; color: white; cursor: pointer; font-size: 13px;"
+                            class="btn btn-danger"
                             onclick={ctx.link().callback(|_| PaintMsg::Clear)}
                         >
                             { "🗑️ Clear" }
@@ -229,12 +216,12 @@ impl Component for Paint {
                 </div>
                 
                 // Canvas area
-                <div style="flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; background-color: #888; padding: 16px;">
+                <div class="paint-canvas-container">
                     <canvas 
                         ref={self.canvas_ref.clone()}
                         width={self.canvas_width.to_string()}
                         height={self.canvas_height.to_string()}
-                        style="background-color: white; cursor: crosshair; box-shadow: 0 4px 12px rgba(0,0,0,0.3);"
+                        class="paint-canvas"
                         {onmousedown}
                         {onmousemove}
                         {onmouseup}
@@ -243,7 +230,7 @@ impl Component for Paint {
                 </div>
                 
                 // Status bar
-                <div style="padding: 4px 12px; background-color: #e0e0e0; border-top: 1px solid #ccc; font-size: 12px; color: #666; display: flex; gap: 16px;">
+                <div class="paint-status">
                     <span>{ format!("Tool: {:?}", self.current_tool) }</span>
                     <span>{ format!("Size: {}px", self.brush_size) }</span>
                     <span>{ format!("Canvas: {}×{}", self.canvas_width, self.canvas_height) }</span>
@@ -264,14 +251,8 @@ impl Paint {
         let is_active = self.current_tool == tool;
         
         html! {
-            <button 
-                style={format!(
-                    "width: 36px; height: 36px; border-radius: 4px; cursor: pointer; \
-                     display: flex; align-items: center; justify-content: center; font-size: 18px; \
-                     border: 2px solid {}; background-color: {};",
-                    if is_active { "#4a9eff" } else { "transparent" },
-                    if is_active { "rgba(74, 158, 255, 0.1)" } else { "white" }
-                )}
+            <button
+                class={classes!("paint-tool", is_active.then_some("active"))}
                 onclick={ctx.link().callback(move |_| PaintMsg::SetTool(tool))}
                 title={title.to_string()}
             >

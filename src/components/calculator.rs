@@ -1,6 +1,5 @@
 use yew::prelude::*;
 use web_sys::KeyboardEvent;
-use wasm_bindgen::JsCast;
 
 pub struct Calculator {
     display: String,
@@ -165,18 +164,17 @@ impl Component for Calculator {
         let onkeydown = ctx.link().callback(CalculatorMsg::KeyDown);
 
         html! {
-            <div 
-                class="calculator" 
-                style="display: flex; flex-direction: column; height: 100%; background: linear-gradient(180deg, #1a1a1a 0%, #2d2d2d 100%); padding: 16px;"
+            <div
+                class="calculator"
                 tabindex="0"
                 {onkeydown}
             >
                 // Display
-                <div style="background: linear-gradient(180deg, #0a0a0a 0%, #1a1a1a 100%); border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: inset 0 2px 8px rgba(0,0,0,0.5);">
-                    <div style="color: #888; font-size: 14px; min-height: 20px; text-align: right; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis;">
+                <div class="calculator-display">
+                    <div class="calculator-expression">
                         { &self.expression }
                     </div>
-                    <div style="color: white; font-size: 42px; font-weight: 300; text-align: right; overflow: hidden; text-overflow: ellipsis; font-family: 'Segoe UI', sans-serif;">
+                    <div class="calculator-result">
                         { &self.display }
                     </div>
                 </div>
@@ -185,7 +183,7 @@ impl Component for Calculator {
                 {
                     if self.memory != 0.0 {
                         html! {
-                            <div style="color: #4a9eff; font-size: 11px; margin-bottom: 8px; padding-left: 4px;">
+                            <div class="calculator-memory">
                                 { format!("M: {}", self.format_number(self.memory)) }
                             </div>
                         }
@@ -195,7 +193,7 @@ impl Component for Calculator {
                 }
                 
                 // Buttons
-                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; flex: 1;">
+                <div class="calculator-buttons">
                     // Row 1: Memory functions
                     { self.render_button(ctx, "MC", "memory", CalculatorMsg::MemoryClear) }
                     { self.render_button(ctx, "MR", "memory", CalculatorMsg::MemoryRecall) }
@@ -238,44 +236,13 @@ impl Component for Calculator {
 }
 
 impl Calculator {
+    /// Hover and press states are CSS (`.calculator-button:hover`), not
+    /// hand-rolled JS style mutation.
     fn render_button(&self, ctx: &Context<Self>, label: &str, btn_type: &str, msg: CalculatorMsg) -> Html {
-        let (bg_color, hover_color, text_color) = match btn_type {
-            "number" => ("#3d3d3d", "#4d4d4d", "#ffffff"),
-            "operator" => ("#ff9500", "#ffaa33", "#ffffff"),
-            "function" => ("#505050", "#606060", "#ffffff"),
-            "memory" => ("#2d2d2d", "#3d3d3d", "#4a9eff"),
-            "equals" => ("#4a9eff", "#5aaeFF", "#ffffff"),
-            _ => ("#3d3d3d", "#4d4d4d", "#ffffff"),
-        };
-
         html! {
-            <button 
-                style={format!(
-                    "border: none; border-radius: 12px; font-size: 20px; cursor: pointer; \
-                     background-color: {}; color: {}; transition: all 0.15s ease; \
-                     box-shadow: 0 2px 4px rgba(0,0,0,0.2); \
-                     display: flex; align-items: center; justify-content: center;",
-                    bg_color, text_color
-                )}
+            <button
+                class={classes!("calculator-button", btn_type.to_string())}
                 onclick={ctx.link().callback(move |_| msg.clone())}
-                onmouseover={Callback::from({
-                    let hover = hover_color.to_string();
-                    move |e: MouseEvent| {
-                        if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
-                            let _ = el.style().set_property("background-color", &hover);
-                            let _ = el.style().set_property("transform", "scale(0.98)");
-                        }
-                    }
-                })}
-                onmouseout={Callback::from({
-                    let bg = bg_color.to_string();
-                    move |e: MouseEvent| {
-                        if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
-                            let _ = el.style().set_property("background-color", &bg);
-                            let _ = el.style().set_property("transform", "scale(1)");
-                        }
-                    }
-                })}
             >
                 { label }
             </button>

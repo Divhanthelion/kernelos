@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 use web_sys::Storage;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const FS_STORAGE_KEY: &str = "kernelosv2_fs";
 const FILE_CONTENT_PREFIX: &str = "kernelosv2_file:";
@@ -102,7 +102,7 @@ impl FileSystem {
 
         self.write_file_internal(
             "/system/config/theme.json",
-            r##"{"theme": "dark", "accent": "#4a9eff", "wallpaper": "gradient"}"##,
+            r##"{"theme": "dark", "accent": "#4a9eff", "wallpaper": "gradient1"}"##,
             now,
         )?;
 
@@ -160,20 +160,39 @@ impl FileSystem {
         Ok(())
     }
 
+    // Both of these reach through wasm-bindgen, which panics when called off a
+    // wasm target. Gating them keeps the tree logic exercisable under `cargo test`.
+
+    #[cfg(target_arch = "wasm32")]
     fn get_storage() -> Option<Storage> {
         web_sys::window()
             .and_then(|w| w.local_storage().ok())
             .flatten()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_storage() -> Option<Storage> {
+        None
+    }
+
+    #[cfg(target_arch = "wasm32")]
     fn current_timestamp() -> u64 {
         js_sys::Date::now() as u64
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn current_timestamp() -> u64 {
+        0
+    }
+
+    /// Persist metadata to local storage. When storage is unavailable — private
+    /// browsing, or a non-browser host such as the test runner — the filesystem
+    /// degrades to in-memory rather than failing every operation.
     pub fn save(&self) -> Result<(), String> {
-        let storage = Self::get_storage()
-            .ok_or_else(|| "Local storage not available".to_string())?;
-        
+        let Some(storage) = Self::get_storage() else {
+            return Ok(());
+        };
+
         let serialized = serde_json::to_string(self)
             .map_err(|e| format!("Failed to serialize filesystem: {}", e))?;
 
@@ -363,6 +382,10 @@ impl FileSystem {
             return Err(format!("'{}' already exists", new_path));
         }
 
+        if Self::is_inside(&old_path, &new_path) {
+            return Err(format!("Cannot move '{}' into itself", old_path));
+        }
+
         let metadata = self.files.remove(&old_path).unwrap();
         let new_name = Path::new(&new_path)
             .file_name()
@@ -371,22 +394,34 @@ impl FileSystem {
             .to_string();
 
         let now = Self::current_timestamp();
-        
+        let is_directory = matches!(metadata.file_type, FileType::Directory);
+
         self.files.insert(new_path.clone(), FileMetadata {
             name: new_name,
             modified: now,
             ..metadata
         });
 
-        // If it's a file, move the content
-        if let Some(storage) = Self::get_storage() {
-            let old_key = format!("{}{}", FILE_CONTENT_PREFIX, old_path);
-            let new_key = format!("{}{}", FILE_CONTENT_PREFIX, new_path);
-            
-            if let Ok(Some(content)) = storage.get_item(&old_key) {
-                let _ = storage.set_item(&new_key, &content);
-                let _ = storage.remove_item(&old_key);
+        let storage = Self::get_storage();
+
+        // A directory carries its whole subtree with it; without this the
+        // children keep their old keys and become unreachable orphans.
+        if is_directory {
+            for (child_path, relative) in self.descendants_of(&old_path) {
+                let child_new_path = format!("{}/{}", new_path, relative);
+                let child = self.files.remove(&child_path).unwrap();
+                let is_file = matches!(child.file_type, FileType::File);
+
+                self.files.insert(child_new_path.clone(), child);
+
+                if is_file {
+                    if let Some(storage) = &storage {
+                        Self::move_content(storage, &child_path, &child_new_path, false);
+                    }
+                }
             }
+        } else if let Some(storage) = &storage {
+            Self::move_content(storage, &old_path, &new_path, false);
         }
 
         self.save()?;
@@ -405,12 +440,18 @@ impl FileSystem {
             return Err(format!("'{}' already exists", dest_path));
         }
 
+        if Self::is_inside(&src_path, &dest_path) {
+            return Err(format!("Cannot copy '{}' into itself", src_path));
+        }
+
         let now = Self::current_timestamp();
         let new_name = Path::new(&dest_path)
             .file_name()
             .ok_or_else(|| "Invalid path".to_string())?
             .to_string_lossy()
             .to_string();
+
+        let is_directory = matches!(src_metadata.file_type, FileType::Directory);
 
         self.files.insert(dest_path.clone(), FileMetadata {
             name: new_name,
@@ -419,14 +460,30 @@ impl FileSystem {
             ..src_metadata
         });
 
-        // Copy file content if it's a file
-        if let Some(storage) = Self::get_storage() {
-            let src_key = format!("{}{}", FILE_CONTENT_PREFIX, src_path);
-            let dest_key = format!("{}{}", FILE_CONTENT_PREFIX, dest_path);
-            
-            if let Ok(Some(content)) = storage.get_item(&src_key) {
-                let _ = storage.set_item(&dest_key, &content);
+        let storage = Self::get_storage();
+
+        // Copying a directory has to duplicate the whole subtree, otherwise the
+        // destination is an empty shell.
+        if is_directory {
+            for (child_path, relative) in self.descendants_of(&src_path) {
+                let child_dest_path = format!("{}/{}", dest_path, relative);
+                let child = self.files.get(&child_path).unwrap().clone();
+                let is_file = matches!(child.file_type, FileType::File);
+
+                self.files.insert(child_dest_path.clone(), FileMetadata {
+                    created: now,
+                    modified: now,
+                    ..child
+                });
+
+                if is_file {
+                    if let Some(storage) = &storage {
+                        Self::move_content(storage, &child_path, &child_dest_path, true);
+                    }
+                }
             }
+        } else if let Some(storage) = &storage {
+            Self::move_content(storage, &src_path, &dest_path, true);
         }
 
         self.save()?;
@@ -450,25 +507,56 @@ impl FileSystem {
         self.files.get(&path).cloned()
     }
 
-    fn normalize_path(path: &str) -> String {
-        let path = path.trim();
-        
-        if path.is_empty() || path == "." {
-            return "/".to_string();
+    /// Resolve a path to its canonical absolute form, collapsing `.` and `..`
+    /// segments and any redundant or trailing slashes. Paths are always rooted:
+    /// `..` at the root is a no-op rather than an escape.
+    pub fn normalize_path(path: &str) -> String {
+        let mut stack: Vec<&str> = Vec::new();
+
+        for segment in path.trim().split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                name => stack.push(name),
+            }
         }
 
-        let mut normalized = PathBuf::from(path);
-        
-        // Handle relative paths and normalize
-        let result = normalized.to_string_lossy().to_string();
-        
-        // Remove trailing slash unless it's root
-        if result.len() > 1 && result.ends_with('/') {
-            result[..result.len()-1].to_string()
-        } else if result.is_empty() {
+        if stack.is_empty() {
             "/".to_string()
         } else {
-            result
+            format!("/{}", stack.join("/"))
+        }
+    }
+
+    /// Every descendant of `path`, as (current_path, path_relative_to_dir).
+    fn descendants_of(&self, path: &str) -> Vec<(String, String)> {
+        let prefix = format!("{}/", path);
+        self.files
+            .keys()
+            .filter_map(|p| {
+                p.strip_prefix(&prefix)
+                    .map(|rest| (p.clone(), rest.to_string()))
+            })
+            .collect()
+    }
+
+    /// True if `dest` sits inside `src`, which would make a move or copy
+    /// of `src` into `dest` recurse forever.
+    fn is_inside(src: &str, dest: &str) -> bool {
+        dest == src || dest.starts_with(&format!("{}/", src))
+    }
+
+    fn move_content(storage: &Storage, from: &str, to: &str, keep_source: bool) {
+        let from_key = format!("{}{}", FILE_CONTENT_PREFIX, from);
+        let to_key = format!("{}{}", FILE_CONTENT_PREFIX, to);
+
+        if let Ok(Some(content)) = storage.get_item(&from_key) {
+            let _ = storage.set_item(&to_key, &content);
+            if !keep_source {
+                let _ = storage.remove_item(&from_key);
+            }
         }
     }
 }
@@ -477,11 +565,159 @@ impl FileSystem {
 mod tests {
     use super::*;
 
+    /// A filesystem with no storage backing, for exercising tree logic.
+    fn tree(paths: &[(&str, FileType)]) -> FileSystem {
+        let mut files = HashMap::new();
+        files.insert("/".to_string(), FileMetadata {
+            name: "/".to_string(),
+            file_type: FileType::Directory,
+            size: 0,
+            created: 0,
+            modified: 0,
+        });
+
+        for (path, file_type) in paths {
+            files.insert(path.to_string(), FileMetadata {
+                name: path.rsplit('/').next().unwrap().to_string(),
+                file_type: file_type.clone(),
+                size: 0,
+                created: 0,
+                modified: 0,
+            });
+        }
+
+        FileSystem { files }
+    }
+
+    fn sorted_paths(fs: &FileSystem) -> Vec<String> {
+        let mut paths: Vec<String> = fs.files.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
     #[test]
-    fn test_normalize_path() {
+    fn normalize_path_handles_edge_cases() {
         assert_eq!(FileSystem::normalize_path(""), "/");
         assert_eq!(FileSystem::normalize_path("."), "/");
+        assert_eq!(FileSystem::normalize_path("/"), "/");
         assert_eq!(FileSystem::normalize_path("/home"), "/home");
         assert_eq!(FileSystem::normalize_path("/home/"), "/home");
+        assert_eq!(FileSystem::normalize_path("/home//documents"), "/home/documents");
+        assert_eq!(FileSystem::normalize_path("  /home/documents  "), "/home/documents");
+    }
+
+    #[test]
+    fn normalize_path_resolves_dot_segments() {
+        assert_eq!(FileSystem::normalize_path("/home/documents/.."), "/home");
+        assert_eq!(FileSystem::normalize_path("/home/documents/../readme.md"), "/home/readme.md");
+        assert_eq!(FileSystem::normalize_path("/home/./documents"), "/home/documents");
+        assert_eq!(FileSystem::normalize_path("/home/a/b/../../c"), "/home/c");
+    }
+
+    #[test]
+    fn normalize_path_cannot_escape_root() {
+        assert_eq!(FileSystem::normalize_path("/.."), "/");
+        assert_eq!(FileSystem::normalize_path("/../../.."), "/");
+        assert_eq!(FileSystem::normalize_path("/home/../../etc"), "/etc");
+    }
+
+    #[test]
+    fn is_inside_detects_containment() {
+        assert!(FileSystem::is_inside("/home", "/home"));
+        assert!(FileSystem::is_inside("/home", "/home/documents"));
+        assert!(!FileSystem::is_inside("/home", "/homework"));
+        assert!(!FileSystem::is_inside("/home/documents", "/home"));
+    }
+
+    #[test]
+    fn renaming_a_directory_carries_its_children() {
+        let mut fs = tree(&[
+            ("/home", FileType::Directory),
+            ("/home/documents", FileType::Directory),
+            ("/home/documents/welcome.txt", FileType::File),
+            ("/home/documents/nested", FileType::Directory),
+            ("/home/documents/nested/deep.txt", FileType::File),
+        ]);
+
+        fs.rename("/home/documents", "/home/archive").unwrap();
+
+        assert_eq!(sorted_paths(&fs), vec![
+            "/",
+            "/home",
+            "/home/archive",
+            "/home/archive/nested",
+            "/home/archive/nested/deep.txt",
+            "/home/archive/welcome.txt",
+        ]);
+        assert_eq!(fs.get_metadata("/home/archive").unwrap().name, "archive");
+    }
+
+    #[test]
+    fn copying_a_directory_duplicates_its_subtree() {
+        let mut fs = tree(&[
+            ("/home", FileType::Directory),
+            ("/home/documents", FileType::Directory),
+            ("/home/documents/welcome.txt", FileType::File),
+            ("/home/documents/nested", FileType::Directory),
+            ("/home/documents/nested/deep.txt", FileType::File),
+        ]);
+
+        fs.copy("/home/documents", "/home/backup").unwrap();
+
+        assert_eq!(sorted_paths(&fs), vec![
+            "/",
+            "/home",
+            "/home/backup",
+            "/home/backup/nested",
+            "/home/backup/nested/deep.txt",
+            "/home/backup/welcome.txt",
+            "/home/documents",
+            "/home/documents/nested",
+            "/home/documents/nested/deep.txt",
+            "/home/documents/welcome.txt",
+        ]);
+    }
+
+    #[test]
+    fn sibling_directories_with_shared_prefixes_are_untouched() {
+        let mut fs = tree(&[
+            ("/home", FileType::Directory),
+            ("/home/doc", FileType::Directory),
+            ("/home/doc/a.txt", FileType::File),
+            ("/home/documents", FileType::Directory),
+            ("/home/documents/b.txt", FileType::File),
+        ]);
+
+        fs.rename("/home/doc", "/home/moved").unwrap();
+
+        assert!(fs.exists("/home/moved/a.txt"));
+        assert!(fs.exists("/home/documents/b.txt"));
+        assert!(!fs.exists("/home/documents".replace("documents", "moveduments").as_str()));
+    }
+
+    #[test]
+    fn a_directory_cannot_be_moved_or_copied_into_itself() {
+        let mut fs = tree(&[
+            ("/home", FileType::Directory),
+            ("/home/documents", FileType::Directory),
+        ]);
+
+        assert!(fs.rename("/home/documents", "/home/documents/inner").is_err());
+        assert!(fs.copy("/home/documents", "/home/documents/inner").is_err());
+        assert!(fs.exists("/home/documents"));
+    }
+
+    #[test]
+    fn renaming_a_file_leaves_the_tree_intact() {
+        let mut fs = tree(&[
+            ("/home", FileType::Directory),
+            ("/home/a.txt", FileType::File),
+        ]);
+
+        fs.rename("/home/a.txt", "/home/b.txt").unwrap();
+
+        assert!(!fs.exists("/home/a.txt"));
+        assert!(fs.exists("/home/b.txt"));
+        assert_eq!(fs.get_metadata("/home/b.txt").unwrap().name, "b.txt");
     }
 }

@@ -22,6 +22,7 @@ A fully-featured WebAssembly desktop environment built with Rust and Yew.
 |-----|-------------|
 | 📁 **File Explorer** | Browse, create, delete files and folders with list/grid views |
 | 💻 **Terminal** | Full-featured terminal with 20+ commands (ls, cd, grep, find, etc.) |
+| 🌐 **Browser** | Sandboxed iframe browser with history, a `vfs://` scheme, and Wikipedia search |
 | 📝 **Text Editor** | Edit files with line numbers, word wrap, font sizing |
 | 🔢 **Calculator** | Scientific calculator with memory functions |
 | 🕐 **Clock** | Analog and digital clock with beautiful design |
@@ -29,15 +30,51 @@ A fully-featured WebAssembly desktop environment built with Rust and Yew.
 | 💣 **Minesweeper** | Classic minesweeper game |
 | ⚙️ **Settings** | Customize themes, wallpapers, and system options |
 
+Apps are declared once in [`src/apps.rs`](src/apps.rs). Adding one means adding a
+registry entry and a component — the start menu, desktop icons, quick launch,
+window sizing and window rendering all read from that list.
+
+### 🌐 About the Browser
+
+Pages load in a sandboxed iframe. A large part of the web refuses to be framed
+via `X-Frame-Options` or CSP `frame-ancestors`, and there is no client-side way
+around it — a proxy would mean a backend, which would cost the "runs entirely in
+your browser" property.
+
+| | |
+|---|---|
+| **Frames fine** | Wikipedia, Hacker News, rust-lang.org, doc.rust-lang.org, docs.rs, example.com |
+| **Blocked** | Google, GitHub, DuckDuckGo, Bing |
+
+A blocked frame is indistinguishable from a successful cross-origin one at the
+JS level (both fire `load`), so the browser never guesses: every page keeps an
+`↗` button that opens it in a real tab. Searches go to Wikipedia because the
+major search engines all block framing.
+
+`vfs:///home/documents` browses the virtual filesystem — directories list, files
+render their contents.
+
 ### 💾 Virtual File System
 - Persistent localStorage-backed file system
 - Standard directory structure (/home, /applications, /system)
-- Full CRUD operations on files and directories
+- Full CRUD operations on files and directories, including recursive move and copy
+- Degrades to in-memory when local storage is unavailable (private browsing)
+
+### 🔄 Session Persistence
+
+Open windows, their positions and sizes, plus theme, accent and wallpaper are
+restored on reload. Both are ordinary files inside the VFS, so they are
+inspectable from inside the OS:
+
+```
+cat /system/config/theme.json
+cat /system/config/session.json
+```
 
 ## Quick Start
 
 ### Prerequisites
-- [Rust](https://rustup.rs/) (1.70+)
+- [Rust](https://rustup.rs/) (1.85+ — required by `yew` 0.23 and `rand` 0.10)
 - [trunk](https://trunkrs.dev/) (`cargo install trunk`)
 - wasm32 target (`rustup target add wasm32-unknown-unknown`)
 
@@ -95,7 +132,7 @@ kernelosv2/
 | Command | Description |
 |---------|-------------|
 | `ls [-l] [-a] [path]` | List directory contents |
-| `cd [path]` | Change directory |
+| `cd [path]` | Change directory (`..`, `-` and `~` supported) |
 | `pwd` | Print working directory |
 | `cat [file]` | Display file contents |
 | `mkdir [-p] [dir]` | Create directory |
@@ -145,16 +182,30 @@ MIT License - Feel free to use and modify!
 
 ## Contributing
 
-Contributions welcome! Some ideas for expansion:
+Contributions welcome! Adding an app is a registry entry in
+[`src/apps.rs`](src/apps.rs) plus a component. Some ideas:
+
+- [x] Web browser iframe
 - [ ] Image viewer with zoom/pan
 - [ ] Music player
-- [ ] Web browser iframe
 - [ ] More games (Snake, Tetris)
-- [ ] Markdown preview
+- [ ] Markdown preview (the browser's `vfs://` renderer is a good starting point)
 - [ ] Code syntax highlighting
 - [ ] File compression/decompression
 - [ ] Multi-user support
 - [ ] Cloud sync
+
+### Theming
+
+Theming is driven by a `data-theme` attribute on the document root plus the CSS
+variables at the top of [`styles.css`](styles.css). Every component reads from
+those variables, so light/dark and the accent colour apply everywhere —
+including app interiors.
+
+If you add a component, style it with the variables (`--window-bg`,
+`--text-primary`, `--border-color`, `--accent-primary`, …) rather than literal
+colours. Inline `style` attributes are reserved for genuinely dynamic values:
+window geometry, the wallpaper gradient, colour swatches, editor font size.
 
 ---
 
