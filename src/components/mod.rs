@@ -15,6 +15,7 @@ pub mod minesweeper;
 pub mod notification;
 pub mod start_menu;
 pub mod context_menu;
+pub mod agent;
 
 pub use desktop::Desktop;
 pub use notification::{Notification, NotificationType, NotificationManager};

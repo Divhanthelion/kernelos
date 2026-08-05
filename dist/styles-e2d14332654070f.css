@@ -1704,3 +1704,117 @@
     height: 100%;
     color: var(--text-muted);
 }
+
+/* AI Agent app (M1 streaming transport) */
+.agent-app {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 12px;
+    gap: 10px;
+    color: var(--text-primary);
+    background: var(--window-bg);
+}
+.agent-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex-shrink: 0;
+}
+.agent-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.agent-input {
+    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--input-bg, var(--window-bg));
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: inherit;
+}
+.agent-key-input { font-family: ui-monospace, monospace; }
+.agent-prompt {
+    min-height: 56px;
+    resize: vertical;
+    font-family: inherit;
+}
+.agent-buttons { display: flex; gap: 8px; }
+.agent-btn {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+.agent-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.agent-btn-primary {
+    background: var(--accent-primary);
+    color: #fff;
+}
+.agent-btn-stop {
+    background: #c0392b;
+    color: #fff;
+}
+.agent-error {
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: rgba(192, 57, 43, 0.15);
+    color: #e74c3c;
+    font-size: 13px;
+    flex-shrink: 0;
+}
+.agent-output {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+    min-height: 0;
+}
+.agent-pane {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.agent-pane-header {
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    flex-shrink: 0;
+}
+.agent-reasoning-pane .agent-pane-header {
+    background: rgba(155, 89, 182, 0.15);
+    color: #9b59b6;
+}
+.agent-content-pane .agent-pane-header {
+    background: rgba(74, 158, 255, 0.15);
+    color: var(--accent-primary);
+}
+.agent-pane-body {
+    flex: 1;
+    margin: 0;
+    padding: 10px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.agent-reasoning-pane .agent-pane-body {
+    color: #bb8fce;
+    background: rgba(155, 89, 182, 0.05);
+}
+.agent-content-pane .agent-pane-body {
+    background: var(--window-bg);
+}

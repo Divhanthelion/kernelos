@@ -18,6 +18,7 @@ use crate::components::settings::Settings;
 use crate::components::paint::Paint;
 use crate::components::minesweeper::Minesweeper;
 use crate::components::browser::Browser;
+use crate::components::agent::Agent;
 
 /// Everything an app can reach for when rendering. Passing this as one value
 /// keeps app signatures uniform, which is what lets `render` be a plain fn
@@ -123,6 +124,15 @@ pub const APPS: &[AppDefinition] = &[
         width: 400, height: 500, min_width: 300, min_height: 400,
         on_desktop: true, in_quick_launch: false,
         render: render_minesweeper,
+    },
+    AppDefinition {
+        id: "agent",
+        title: "AI Agent",
+        icon: "🤖",
+        category: "Productivity",
+        width: 700, height: 550, min_width: 400, min_height: 350,
+        on_desktop: true, in_quick_launch: false,
+        render: render_agent,
     },
     AppDefinition {
         id: "settings",
@@ -256,6 +266,10 @@ fn render_paint(_cx: &AppContext) -> Html {
 
 fn render_minesweeper(_cx: &AppContext) -> Html {
     html! { <Minesweeper /> }
+}
+
+fn render_agent(_cx: &AppContext) -> Html {
+    html! { <Agent /> }
 }
 
 fn render_settings(cx: &AppContext) -> Html {

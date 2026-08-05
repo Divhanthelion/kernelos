@@ -5,6 +5,7 @@ pub mod filesystem;
 pub mod apps;
 pub mod session;
 pub mod plugin;
+pub mod agent;
 pub mod components;
 
 use wasm_bindgen::prelude::*;
