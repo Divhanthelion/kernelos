@@ -6,6 +6,7 @@
 //! silent `finish_reason: "stop"` mid-task.
 
 use crate::agent::accum::{ToolCallAccum, TurnAccumulator, UsageAccum};
+use crate::agent::journal::Journal;
 use crate::agent::salvage::salvage_tool_calls;
 use crate::agent::stream::{
     AssistantFunctionCall, AssistantToolCall, ChatMessage, ChatRequest, StreamError,
@@ -39,6 +40,9 @@ pub struct ToolInvocation {
     pub name: String,
     pub arguments: String,
     pub result: String,
+    /// Paths this tool mutated (subset of the run journal). Used for per-file
+    /// diff / revert controls in the transcript.
+    pub changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,13 +96,15 @@ pub enum LoopEvent {
 pub fn tool_round_trip(
     fs: &mut FileSystem,
     turn: &TurnAccumulator,
-) -> Option<(ChatMessage, Vec<ChatMessage>)> {
+    journal: &mut Journal,
+) -> Option<(ChatMessage, Vec<ChatMessage>, Vec<ToolInvocation>)> {
     if turn.tool_calls.is_empty() {
         return None;
     }
 
     let mut assistant_calls = Vec::with_capacity(turn.tool_calls.len());
     let mut tool_messages = Vec::with_capacity(turn.tool_calls.len());
+    let mut invocations = Vec::with_capacity(turn.tool_calls.len());
 
     for tc in &turn.tool_calls {
         let id = tc
@@ -116,7 +122,16 @@ pub fn tool_round_trip(
             },
         });
 
-        let content = execute_tool(fs, &name, &tc.arguments);
+        let content = execute_tool(fs, &name, &tc.arguments, Some(journal));
+        let changed_paths = paths_touched_by_call(&name, &tc.arguments, journal);
+
+        invocations.push(ToolInvocation {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: tc.arguments.clone(),
+            result: content.clone(),
+            changed_paths,
+        });
         tool_messages.push(ChatMessage::tool_result(id, content));
     }
 
@@ -132,7 +147,46 @@ pub fn tool_round_trip(
     };
 
     let assistant = ChatMessage::assistant_with_tools(content, reasoning, assistant_calls);
-    Some((assistant, tool_messages))
+    Some((assistant, tool_messages, invocations))
+}
+
+fn paths_touched_by_call(name: &str, arguments: &str, journal: &Journal) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    match name {
+        "write_file" | "create_directory" | "delete" => {
+            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                let p = FileSystem::normalize_path(p);
+                for e in journal.entries() {
+                    if (e.path == p || FileSystem::is_inside(&p, &e.path))
+                        && e.prior != e.after
+                        && !paths.contains(&e.path)
+                    {
+                        paths.push(e.path.clone());
+                    }
+                }
+            }
+        }
+        "rename" => {
+            for key in ["old_path", "new_path"] {
+                if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
+                    let p = FileSystem::normalize_path(p);
+                    for e in journal.entries() {
+                        if (e.path == p || FileSystem::is_inside(&p, &e.path))
+                            && e.prior != e.after
+                            && !paths.contains(&e.path)
+                        {
+                            paths.push(e.path.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    paths
 }
 
 /// Resolve tool calls from a completed turn — structured first, then salvage.
@@ -166,6 +220,7 @@ pub fn resolve_tool_calls(turn: &TurnAccumulator) -> (Vec<ToolCallAccum>, bool) 
 /// so the UI can keep an `Rc<RefCell<FileSystem>>` live for other apps.
 pub async fn run_agent_loop<F, Fut>(
     fs: &Rc<RefCell<FileSystem>>,
+    journal: &Rc<RefCell<Journal>>,
     request: &mut ChatRequest,
     config: &LoopConfig,
     is_aborted: impl Fn() -> bool,
@@ -256,11 +311,12 @@ where
             if trailing_identical_count(&recent) >= REPETITION_LIMIT {
                 // Still execute this turn's tools so the transcript is honest,
                 // then stop before the next request.
-                let (assistant, tool_msgs) = {
+                let (assistant, tool_msgs, tools) = {
                     let mut filesystem = fs.borrow_mut();
-                    tool_round_trip(&mut filesystem, &turn).expect("tool_calls non-empty")
+                    let mut j = journal.borrow_mut();
+                    tool_round_trip(&mut filesystem, &turn, &mut j)
+                        .expect("tool_calls non-empty")
                 };
-                let tools = invocations_from(&assistant, &tool_msgs);
                 let transcript = TranscriptTurn {
                     reasoning: turn.reasoning.clone(),
                     content: turn.content.clone(),
@@ -287,11 +343,11 @@ where
             }
         }
 
-        let (assistant, tool_msgs) = {
+        let (assistant, tool_msgs, tools) = {
             let mut filesystem = fs.borrow_mut();
-            tool_round_trip(&mut filesystem, &turn).expect("tool_calls non-empty")
+            let mut j = journal.borrow_mut();
+            tool_round_trip(&mut filesystem, &turn, &mut j).expect("tool_calls non-empty")
         };
-        let tools = invocations_from(&assistant, &tool_msgs);
         let transcript = TranscriptTurn {
             reasoning: turn.reasoning.clone(),
             content: turn.content.clone(),
@@ -318,20 +374,6 @@ fn trailing_identical_count(recent: &[(String, String)]) -> usize {
         .count()
 }
 
-fn invocations_from(assistant: &ChatMessage, tool_msgs: &[ChatMessage]) -> Vec<ToolInvocation> {
-    let calls = assistant.tool_calls.as_deref().unwrap_or(&[]);
-    calls
-        .iter()
-        .zip(tool_msgs.iter())
-        .map(|(tc, msg)| ToolInvocation {
-            id: tc.id.clone(),
-            name: tc.function.name.clone(),
-            arguments: tc.function.arguments.clone(),
-            result: msg.content.clone().unwrap_or_default(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +385,10 @@ mod tests {
 
     fn test_fs() -> Rc<RefCell<FileSystem>> {
         Rc::new(RefCell::new(FileSystem::default()))
+    }
+
+    fn test_journal() -> Rc<RefCell<Journal>> {
+        Rc::new(RefCell::new(Journal::new()))
     }
 
     fn canned_tool_turn(
@@ -378,6 +424,7 @@ mod tests {
     #[test]
     fn three_iteration_run_stops_on_finish_reason_stop() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let script = vec![
             canned_tool_turn(
@@ -418,6 +465,7 @@ mod tests {
         let mut idx = 0;
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || false,
@@ -442,11 +490,13 @@ mod tests {
     #[test]
     fn iteration_cap_fires_at_limit() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let config = LoopConfig { max_iterations: 2 };
         let mut n = 0;
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &config,
             || false,
@@ -475,11 +525,13 @@ mod tests {
     #[test]
     fn repetition_detector_breaks_on_third_identical_tool_args() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let args = r#"{"path":"/home/documents/welcome.txt"}"#;
         let mut n = 0;
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || false,
@@ -511,6 +563,7 @@ mod tests {
     #[test]
     fn assistant_reasoning_content_appears_in_serialized_next_request() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let script = vec![
             canned_tool_turn(
@@ -527,6 +580,7 @@ mod tests {
 
         let _ = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || false,
@@ -572,10 +626,11 @@ mod tests {
             finish_reason: Some("tool_calls".into()),
             usage: UsageAccum::default(),
         };
-        let (assistant, tools) = tool_round_trip(&mut fs, &turn).unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].tool_call_id.as_deref(), Some("call_a"));
-        assert_eq!(tools[1].tool_call_id.as_deref(), Some("call_b"));
+        let (assistant, tool_msgs, inv) = tool_round_trip(&mut fs, &turn, &mut Journal::new()).unwrap();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(inv.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_a"));
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("call_b"));
         let ids: Vec<_> = assistant
             .tool_calls
             .as_ref()
@@ -589,6 +644,7 @@ mod tests {
     #[test]
     fn loop_salvages_plain_text_tool_call() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let script = vec![
             TurnAccumulator {
@@ -603,6 +659,7 @@ mod tests {
         let mut idx = 0;
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || false,
@@ -625,6 +682,7 @@ mod tests {
     #[test]
     fn usage_accumulates_across_iterations() {
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let script = vec![
             canned_tool_turn(
@@ -653,6 +711,7 @@ mod tests {
         let mut idx = 0;
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || false,
@@ -676,10 +735,12 @@ mod tests {
         use std::cell::Cell;
 
         let fs = test_fs();
+        let journal = test_journal();
         let mut request = ChatRequest::streaming_with_tools("go", tool_definitions());
         let n = Cell::new(0);
         let outcome = pollster::block_on(run_agent_loop(
             &fs,
+            &journal,
             &mut request,
             &LoopConfig::default(),
             || n.get() >= 1, // abort before second iteration
@@ -724,15 +785,17 @@ mod tests {
             usage: UsageAccum::default(),
         };
 
-        let (assistant, tools) = tool_round_trip(&mut fs, &turn).expect("tool calls present");
+        let (assistant, tool_msgs, inv) =
+            tool_round_trip(&mut fs, &turn, &mut Journal::new()).expect("tool calls present");
         assert_eq!(assistant.role, "assistant");
         assert_eq!(
             assistant.reasoning_content.as_deref(),
             Some("I should create the file")
         );
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(tools[1].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(inv.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("call_2"));
     }
 
     #[test]
@@ -745,6 +808,6 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: UsageAccum::default(),
         };
-        assert!(tool_round_trip(&mut fs, &turn).is_none());
+        assert!(tool_round_trip(&mut fs, &turn, &mut Journal::new()).is_none());
     }
 }

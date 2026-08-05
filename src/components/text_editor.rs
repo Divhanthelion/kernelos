@@ -15,6 +15,11 @@ pub struct TextEditor {
     textarea_ref: NodeRef,
     word_wrap: bool,
     font_size: u32,
+    /// Last VFS content we believe is on disk for the open path.
+    last_known_disk: String,
+    seen_epoch: u64,
+    /// Banner: disk content differs from what we last loaded/saved.
+    external_notice: Option<String>,
 }
 
 pub enum TextEditorMsg {
@@ -26,6 +31,8 @@ pub enum TextEditorMsg {
     ToggleWordWrap,
     IncreaseFontSize,
     DecreaseFontSize,
+    ReloadFromDisk,
+    KeepEditing,
 }
 
 #[derive(Properties, Clone, PartialEq)]
@@ -35,6 +42,8 @@ pub struct TextEditorProps {
     pub file_path: Option<String>,
     #[prop_or_default]
     pub on_notification: Callback<(String, String, String)>,
+    #[prop_or_default]
+    pub vfs_epoch: u64,
 }
 
 impl Component for TextEditor {
@@ -55,7 +64,7 @@ impl Component for TextEditor {
 
         Self {
             fs,
-            content,
+            content: content.clone(),
             file_path,
             is_modified: false,
             line_count,
@@ -64,7 +73,19 @@ impl Component for TextEditor {
             textarea_ref: NodeRef::default(),
             word_wrap: true,
             font_size: 14,
+            last_known_disk: content,
+            seen_epoch: ctx.props().vfs_epoch,
+            external_notice: None,
         }
+    }
+
+    fn changed(&mut self, ctx: &Context<Self>, _old: &Self::Properties) -> bool {
+        if ctx.props().vfs_epoch != self.seen_epoch {
+            self.seen_epoch = ctx.props().vfs_epoch;
+            self.detect_external_change(ctx);
+            return true;
+        }
+        false
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -81,6 +102,8 @@ impl Component for TextEditor {
                     match self.fs.borrow_mut().write_file(path, &self.content) {
                         Ok(_) => {
                             self.is_modified = false;
+                            self.last_known_disk = self.content.clone();
+                            self.external_notice = None;
                             ctx.props().on_notification.emit((
                                 "File Saved".to_string(),
                                 format!("Saved to {}", path),
@@ -107,6 +130,8 @@ impl Component for TextEditor {
                     Ok(_) => {
                         self.file_path = Some(path.clone());
                         self.is_modified = false;
+                        self.last_known_disk = self.content.clone();
+                        self.external_notice = None;
                         ctx.props().on_notification.emit((
                             "File Saved".to_string(),
                             format!("Saved to {}", path),
@@ -164,6 +189,28 @@ impl Component for TextEditor {
             }
             TextEditorMsg::DecreaseFontSize => {
                 self.font_size = (self.font_size - 2).max(10);
+                true
+            }
+            TextEditorMsg::ReloadFromDisk => {
+                if let Some(ref path) = self.file_path {
+                    let disk = self.fs.borrow().read_file(path).unwrap_or_default();
+                    self.content = disk.clone();
+                    self.last_known_disk = disk;
+                    self.is_modified = false;
+                    self.line_count = self.content.lines().count().max(1);
+                    self.external_notice = None;
+                }
+                true
+            }
+            TextEditorMsg::KeepEditing => {
+                // Keep buffer; treat disk as diverged so we don't re-prompt
+                // until the next external write.
+                if let Some(ref path) = self.file_path {
+                    self.last_known_disk =
+                        self.fs.borrow().read_file(path).unwrap_or_default();
+                }
+                self.is_modified = true;
+                self.external_notice = None;
                 true
             }
         }
@@ -227,6 +274,24 @@ impl Component for TextEditor {
                         { "A+" }
                     </button>
                 </div>
+
+                if let Some(notice) = &self.external_notice {
+                    <div class="text-editor-external">
+                        <span>{ notice }</span>
+                        <button
+                            class="btn btn-primary btn-small"
+                            onclick={ctx.link().callback(|_| TextEditorMsg::ReloadFromDisk)}
+                        >
+                            { "Reload" }
+                        </button>
+                        <button
+                            class="btn btn-secondary btn-small"
+                            onclick={ctx.link().callback(|_| TextEditorMsg::KeepEditing)}
+                        >
+                            { "Keep editing" }
+                        </button>
+                    </div>
+                }
                 
                 // Editor area with line numbers
                 <div class="text-editor-body">
@@ -281,5 +346,63 @@ impl Component for TextEditor {
                 let _ = textarea.focus();
             }
         }
+    }
+}
+
+impl TextEditor {
+    fn detect_external_change(&mut self, ctx: &Context<Self>) {
+        let Some(path) = self.file_path.clone() else {
+            return;
+        };
+        let disk = self.fs.borrow().read_file(&path).unwrap_or_default();
+        if disk == self.last_known_disk {
+            return;
+        }
+
+        // Genuine conflict of intent — prompt rather than silently diverging.
+        let msg = if self.is_modified && self.content != disk {
+            format!(
+                "“{path}” was changed outside the editor (e.g. by the agent) \
+                 and you have unsaved edits. Reload from disk and discard your edits?"
+            )
+        } else {
+            format!(
+                "“{path}” was changed outside the editor (e.g. by the agent). Reload?"
+            )
+        };
+
+        let reload = confirm_external(&msg);
+        if reload {
+            self.content = disk.clone();
+            self.last_known_disk = disk;
+            self.is_modified = false;
+            self.line_count = self.content.lines().count().max(1);
+            self.external_notice = None;
+            ctx.props().on_notification.emit((
+                "Reloaded".into(),
+                format!("Reloaded {path} from disk"),
+                "info".into(),
+            ));
+        } else {
+            self.last_known_disk = disk;
+            self.is_modified = true;
+            self.external_notice = Some(format!(
+                "{path} changed on disk — reload or keep editing"
+            ));
+        }
+    }
+}
+
+fn confirm_external(message: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.confirm_with_message(message).ok())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = message;
+        false
     }
 }

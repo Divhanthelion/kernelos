@@ -28,6 +28,8 @@ pub struct Desktop {
     wallpaper: String,
     /// Session restore waits until asynchronous plugin storage is ready.
     pending_session: Option<Session>,
+    /// Bumped when the agent mutates the VFS so editors/explorer re-read.
+    vfs_epoch: u64,
 }
 
 pub enum DesktopMsg {
@@ -71,6 +73,9 @@ pub enum DesktopMsg {
     PluginsChanged,
     /// Persisted plugin bytes are loaded and saved windows can be restored.
     PluginsReady,
+
+    /// Agent (or undo) mutated the VFS — bump epoch so editors/explorer refresh.
+    VfsMutated,
 }
 
 impl Component for Desktop {
@@ -105,6 +110,7 @@ impl Component for Desktop {
             accent: config.accent,
             wallpaper: config.wallpaper,
             pending_session: Some(session),
+            vfs_epoch: 0,
         };
 
         // IndexedDB plugin bytes load asynchronously. Session restore is
@@ -292,6 +298,10 @@ impl Component for Desktop {
                 }
                 true
             }
+            DesktopMsg::VfsMutated => {
+                self.vfs_epoch = self.vfs_epoch.wrapping_add(1);
+                true
+            }
         }
     }
 
@@ -363,6 +373,8 @@ impl Component for Desktop {
                                 on_wallpaper_change={ctx.link().callback(DesktopMsg::SetWallpaper)}
                                 on_accent_change={ctx.link().callback(DesktopMsg::SetAccent)}
                                 on_geometry_changed={ctx.link().callback(|_| DesktopMsg::WindowGeometryChanged)}
+                                vfs_epoch={self.vfs_epoch}
+                                on_vfs_mutated={ctx.link().callback(|_| DesktopMsg::VfsMutated)}
                             />
                         }
                     }).collect::<Html>()

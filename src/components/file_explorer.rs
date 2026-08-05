@@ -13,6 +13,7 @@ pub struct FileExplorer {
     view_mode: ViewMode,
     sort_by: SortBy,
     sort_ascending: bool,
+    seen_epoch: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -46,6 +47,8 @@ pub enum FileExplorerMsg {
 pub struct FileExplorerProps {
     pub fs: Rc<RefCell<FileSystem>>,
     pub on_open_file: Callback<(String, String)>,
+    #[prop_or_default]
+    pub vfs_epoch: u64,
 }
 
 impl Component for FileExplorer {
@@ -67,7 +70,24 @@ impl Component for FileExplorer {
             view_mode: ViewMode::List,
             sort_by: SortBy::Name,
             sort_ascending: true,
+            seen_epoch: ctx.props().vfs_epoch,
         }
+    }
+
+    fn changed(&mut self, ctx: &Context<Self>, _old: &Self::Properties) -> bool {
+        if ctx.props().vfs_epoch != self.seen_epoch {
+            self.seen_epoch = ctx.props().vfs_epoch;
+            let result = self.fs.borrow().list_directory(&self.current_path);
+            match result {
+                Ok(files) => {
+                    self.files = files;
+                    self.sort_files();
+                }
+                Err(e) => self.error_message = Some(e),
+            }
+            return true;
+        }
+        false
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {

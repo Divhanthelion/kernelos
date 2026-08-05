@@ -110,6 +110,8 @@ pub struct WindowProps {
     pub on_wallpaper_change: Callback<String>,
     pub on_accent_change: Callback<String>,
     pub on_geometry_changed: Callback<()>,
+    pub vfs_epoch: u64,
+    pub on_vfs_mutated: Callback<()>,
 }
 
 pub struct Window {
@@ -447,6 +449,8 @@ impl Window {
             on_theme_change: ctx.props().on_theme_change.clone(),
             on_wallpaper_change: ctx.props().on_wallpaper_change.clone(),
             on_accent_change: ctx.props().on_accent_change.clone(),
+            vfs_epoch: ctx.props().vfs_epoch,
+            on_vfs_mutated: ctx.props().on_vfs_mutated.clone(),
         };
 
         (app.render)(&context)

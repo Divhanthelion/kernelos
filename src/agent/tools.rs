@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use crate::agent::journal::{
+    confirm_gate, is_protected_path, Journal, RECURSIVE_DELETE_GATE_THRESHOLD,
+};
 use crate::filesystem::FileSystem;
 
 /// Soft cap on tool-result content returned to the model.
@@ -148,7 +151,15 @@ fn tool_def(
 
 /// Execute one tool call. `arguments` is a JSON-encoded string (may be malformed).
 /// Returns a string content payload suitable for a `{role:"tool"}` message.
-pub fn execute_tool(fs: &mut FileSystem, name: &str, arguments: &str) -> String {
+///
+/// When `journal` is provided, mutating tools record first-touch priors and
+/// refresh `after` snapshots. Read-only tools do not touch the journal.
+pub fn execute_tool(
+    fs: &mut FileSystem,
+    name: &str,
+    arguments: &str,
+    journal: Option<&mut Journal>,
+) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => {
@@ -158,11 +169,11 @@ pub fn execute_tool(fs: &mut FileSystem, name: &str, arguments: &str) -> String 
 
     let result = match name {
         "read_file" => exec_read_file(fs, &args),
-        "write_file" => exec_write_file(fs, &args),
+        "write_file" => exec_write_file(fs, &args, journal),
         "list_directory" => exec_list_directory(fs, &args),
-        "create_directory" => exec_create_directory(fs, &args),
-        "delete" => exec_delete(fs, &args),
-        "rename" => exec_rename(fs, &args),
+        "create_directory" => exec_create_directory(fs, &args, journal),
+        "delete" => exec_delete(fs, &args, journal),
+        "rename" => exec_rename(fs, &args, journal),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -185,15 +196,40 @@ fn require_bool(args: &Value, key: &str) -> Result<bool, String> {
         .ok_or_else(|| format!("missing or non-boolean argument '{key}'"))
 }
 
+fn gate_protected(path: &str) -> Result<(), String> {
+    if is_protected_path(path) {
+        let msg = format!(
+            "modification of '{path}' is gated (/system/config). Proceed?"
+        );
+        if !confirm_gate(&msg) {
+            return Err(format!(
+                "refused: '{path}' is under /system/config (gated)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn exec_read_file(fs: &FileSystem, args: &Value) -> Result<String, String> {
     let path = require_str(args, "path")?;
     fs.read_file(path)
 }
 
-fn exec_write_file(fs: &mut FileSystem, args: &Value) -> Result<String, String> {
+fn exec_write_file(
+    fs: &mut FileSystem,
+    args: &Value,
+    mut journal: Option<&mut Journal>,
+) -> Result<String, String> {
     let path = require_str(args, "path")?;
     let content = require_str(args, "content")?;
+    gate_protected(path)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.touch(fs, path);
+    }
     fs.write_file(path, content)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.record_after(fs, path);
+    }
     Ok(format!("wrote {} bytes to {path}", content.len()))
 }
 
@@ -213,24 +249,98 @@ fn exec_list_directory(fs: &FileSystem, args: &Value) -> Result<String, String> 
     Ok(lines.join("\n"))
 }
 
-fn exec_create_directory(fs: &mut FileSystem, args: &Value) -> Result<String, String> {
+fn exec_create_directory(
+    fs: &mut FileSystem,
+    args: &Value,
+    mut journal: Option<&mut Journal>,
+) -> Result<String, String> {
     let path = require_str(args, "path")?;
     let create_parents = require_bool(args, "create_parents")?;
+    gate_protected(path)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.touch(fs, path);
+        if create_parents {
+            let mut cursor = std::path::Path::new(path);
+            while let Some(parent) = cursor.parent() {
+                let p = parent.to_string_lossy();
+                if p.is_empty() || p == "/" {
+                    break;
+                }
+                if !fs.exists(p.as_ref()) {
+                    j.touch(fs, p.as_ref());
+                }
+                cursor = parent;
+            }
+        }
+    }
     fs.create_directory(path, create_parents)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.record_after(fs, path);
+        // Parents created via create_parents were touched as Absent — refresh.
+        let mut cursor = std::path::Path::new(path);
+        while let Some(parent) = cursor.parent() {
+            let p = parent.to_string_lossy();
+            if p.is_empty() || p == "/" {
+                break;
+            }
+            j.record_after(fs, p.as_ref());
+            cursor = parent;
+        }
+    }
     Ok(format!("created directory {path}"))
 }
 
-fn exec_delete(fs: &mut FileSystem, args: &Value) -> Result<String, String> {
+fn exec_delete(
+    fs: &mut FileSystem,
+    args: &Value,
+    mut journal: Option<&mut Journal>,
+) -> Result<String, String> {
     let path = require_str(args, "path")?;
     let recursive = require_bool(args, "recursive")?;
+    gate_protected(path)?;
+
+    if recursive && fs.is_directory(path) {
+        let n = 1 + fs.descendants_of(path).len();
+        if n >= RECURSIVE_DELETE_GATE_THRESHOLD {
+            let msg = format!(
+                "Recursive delete of {n} entries under '{path}' exceeds threshold \
+                 ({RECURSIVE_DELETE_GATE_THRESHOLD}). Proceed?"
+            );
+            if !confirm_gate(&msg) {
+                return Err(format!(
+                    "refused: recursive delete of {n} entries under '{path}' \
+                     exceeds gate threshold {RECURSIVE_DELETE_GATE_THRESHOLD}"
+                ));
+            }
+        }
+    }
+
+    if let Some(j) = journal.as_deref_mut() {
+        j.touch_delete(fs, path, recursive);
+    }
     fs.delete(path, recursive)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.record_after_delete(fs, path);
+    }
     Ok(format!("deleted {path}"))
 }
 
-fn exec_rename(fs: &mut FileSystem, args: &Value) -> Result<String, String> {
+fn exec_rename(
+    fs: &mut FileSystem,
+    args: &Value,
+    mut journal: Option<&mut Journal>,
+) -> Result<String, String> {
     let old_path = require_str(args, "old_path")?;
     let new_path = require_str(args, "new_path")?;
+    gate_protected(old_path)?;
+    gate_protected(new_path)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.touch_rename(fs, old_path, new_path);
+    }
     fs.rename(old_path, new_path)?;
+    if let Some(j) = journal.as_deref_mut() {
+        j.record_after_rename(fs, old_path, new_path);
+    }
     Ok(format!("renamed {old_path} → {new_path}"))
 }
 
@@ -261,6 +371,7 @@ pub fn truncate_result(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::journal::PathState;
     use crate::filesystem::FileSystem;
 
     #[test]
@@ -295,7 +406,7 @@ mod tests {
     #[test]
     fn malformed_arguments_produce_tool_error_not_panic() {
         let mut fs = FileSystem::default();
-        let out = execute_tool(&mut fs, "read_file", "not-json{{{");
+        let out = execute_tool(&mut fs, "read_file", "not-json{{{", None);
         assert!(out.starts_with("error: malformed arguments JSON:"), "{out}");
     }
 
@@ -316,6 +427,7 @@ mod tests {
             &mut fs,
             "create_directory",
             r#"{"path":"/tmp","create_parents":true}"#,
+            None,
         );
         assert_eq!(created, "created directory /tmp");
 
@@ -323,16 +435,18 @@ mod tests {
             &mut fs,
             "create_directory",
             r#"{"path":"/tmp/a","create_parents":false}"#,
+            None,
         );
         assert_eq!(nested, "created directory /tmp/a");
 
-        let listed = execute_tool(&mut fs, "list_directory", r#"{"path":"/tmp"}"#);
+        let listed = execute_tool(&mut fs, "list_directory", r#"{"path":"/tmp"}"#, None);
         assert!(listed.contains("a"), "{listed}");
 
         let renamed = execute_tool(
             &mut fs,
             "rename",
             r#"{"old_path":"/tmp/a","new_path":"/tmp/b"}"#,
+            None,
         );
         assert_eq!(renamed, "renamed /tmp/a → /tmp/b");
 
@@ -340,6 +454,7 @@ mod tests {
             &mut fs,
             "delete",
             r#"{"path":"/tmp/b","recursive":false}"#,
+            None,
         );
         assert_eq!(deleted, "deleted /tmp/b");
 
@@ -347,27 +462,70 @@ mod tests {
             &mut fs,
             "write_file",
             r#"{"path":"/home/documents/notes.txt","content":"hello"}"#,
+            None,
         );
         assert_eq!(wrote, "wrote 5 bytes to /home/documents/notes.txt");
         assert!(fs.exists("/home/documents/notes.txt"));
 
-        // Content lives in localStorage; unavailable under `cargo test`, so
-        // read_file surfaces the FileSystem error rather than panicking.
         let read = execute_tool(
             &mut fs,
             "read_file",
             r#"{"path":"/home/documents/notes.txt"}"#,
+            None,
         );
-        assert!(
-            read == "hello" || read.starts_with("error:"),
-            "{read}"
-        );
+        assert_eq!(read, "hello");
     }
 
     #[test]
     fn unknown_tool_returns_error_string() {
         let mut fs = FileSystem::default();
-        let out = execute_tool(&mut fs, "not_a_tool", r#"{}"#);
+        let out = execute_tool(&mut fs, "not_a_tool", r#"{}"#, None);
         assert_eq!(out, "error: unknown tool: not_a_tool");
+    }
+
+    #[test]
+    fn mutating_tools_record_first_touch_in_journal() {
+        let mut fs = FileSystem::default();
+        let mut journal = Journal::new();
+        let _ = execute_tool(
+            &mut fs,
+            "write_file",
+            r#"{"path":"/home/documents/j.txt","content":"one"}"#,
+            Some(&mut journal),
+        );
+        let _ = execute_tool(
+            &mut fs,
+            "write_file",
+            r#"{"path":"/home/documents/j.txt","content":"two"}"#,
+            Some(&mut journal),
+        );
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.changed_paths().len(), 1);
+        match &journal.get("/home/documents/j.txt").unwrap().after {
+            PathState::File { content, .. } => assert_eq!(content, "two"),
+            other => panic!("expected file after, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gated_recursive_delete_refused_on_host() {
+        let mut fs = FileSystem::default();
+        // Seed enough files under /tmp/wipe to exceed the gate threshold.
+        fs.create_directory("/tmp/wipe", true).unwrap();
+        for i in 0..RECURSIVE_DELETE_GATE_THRESHOLD {
+            let p = format!("/tmp/wipe/f{i}.txt");
+            fs.write_file(&p, "x").unwrap();
+        }
+        let out = execute_tool(
+            &mut fs,
+            "delete",
+            r#"{"path":"/tmp/wipe","recursive":true}"#,
+            None,
+        );
+        assert!(
+            out.starts_with("error: refused:"),
+            "expected gate refusal on host, got {out}"
+        );
+        assert!(fs.exists("/tmp/wipe"));
     }
 }

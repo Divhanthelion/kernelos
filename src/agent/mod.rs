@@ -1,12 +1,15 @@
-//! In-tab AI agent: streaming transport (M1), VFS tools (M2), multi-turn loop (M3).
+//! In-tab AI agent: streaming transport (M1), VFS tools (M2), multi-turn loop (M3),
+//! copy-on-write journal / undo (M4).
 
 pub mod accum;
+pub mod journal;
 pub mod roundtrip;
 pub mod salvage;
 pub mod stream;
 pub mod tools;
 
 pub use accum::{ToolCallAccum, TurnAccumulator, UsageAccum};
+pub use journal::{FileDelta, Journal, PathState, RECURSIVE_DELETE_GATE_THRESHOLD};
 pub use roundtrip::{
     run_agent_loop, tool_round_trip, LoopConfig, LoopEvent, LoopOutcome, LoopStopReason,
     TranscriptTurn, ToolInvocation, DEFAULT_MAX_ITERATIONS, REPETITION_LIMIT,

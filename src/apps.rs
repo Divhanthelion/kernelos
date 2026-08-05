@@ -34,6 +34,10 @@ pub struct AppContext {
     pub on_theme_change: Callback<String>,
     pub on_wallpaper_change: Callback<String>,
     pub on_accent_change: Callback<String>,
+    /// Monotonic counter bumped whenever the agent (or undo) mutates the VFS.
+    /// Sibling apps compare against their last-seen value to detect external edits.
+    pub vfs_epoch: u64,
+    pub on_vfs_mutated: Callback<()>,
 }
 
 pub struct AppDefinition {
@@ -231,7 +235,13 @@ pub fn icon_for(id: &str) -> String {
 }
 
 fn render_file_explorer(cx: &AppContext) -> Html {
-    html! { <FileExplorer fs={cx.fs.clone()} on_open_file={cx.on_open_file.clone()} /> }
+    html! {
+        <FileExplorer
+            fs={cx.fs.clone()}
+            on_open_file={cx.on_open_file.clone()}
+            vfs_epoch={cx.vfs_epoch}
+        />
+    }
 }
 
 fn render_terminal(cx: &AppContext) -> Html {
@@ -248,6 +258,7 @@ fn render_text_editor(cx: &AppContext) -> Html {
             fs={cx.fs.clone()}
             file_path={cx.arg.clone()}
             on_notification={cx.on_notification.clone()}
+            vfs_epoch={cx.vfs_epoch}
         />
     }
 }
@@ -269,7 +280,12 @@ fn render_minesweeper(_cx: &AppContext) -> Html {
 }
 
 fn render_agent(cx: &AppContext) -> Html {
-    html! { <Agent fs={cx.fs.clone()} /> }
+    html! {
+        <Agent
+            fs={cx.fs.clone()}
+            on_vfs_mutated={cx.on_vfs_mutated.clone()}
+        />
+    }
 }
 
 fn render_settings(cx: &AppContext) -> Html {

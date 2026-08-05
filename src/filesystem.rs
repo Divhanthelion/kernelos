@@ -30,12 +30,19 @@ pub struct FileMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileSystem {
     files: HashMap<String, FileMetadata>,
+    /// In-memory file bodies. Always updated on write so the VFS remains a
+    /// complete value when localStorage is unavailable (host tests). Mirrored
+    /// to `content_key()` in localStorage when storage is present. Skipped in
+    /// the metadata JSON blob — bodies live under their own keys.
+    #[serde(skip)]
+    contents: HashMap<String, String>,
 }
 
 impl Default for FileSystem {
     fn default() -> Self {
         Self::new().unwrap_or_else(|_| FileSystem {
             files: HashMap::new(),
+            contents: HashMap::new(),
         })
     }
 }
@@ -57,6 +64,7 @@ impl FileSystem {
         // Create new file system with initial structure
         let mut fs = FileSystem {
             files: HashMap::new(),
+            contents: HashMap::new(),
         };
         
         fs.initialize_default_structure()?;
@@ -156,7 +164,8 @@ impl FileSystem {
             modified: timestamp,
         });
 
-        // Store content
+        // Store content in memory (always) and localStorage (when available).
+        self.contents.insert(path.clone(), content.to_string());
         if let Some(storage) = Self::get_storage() {
             let key = content_key(&path);
             storage.set_item(&key, content)
@@ -311,12 +320,16 @@ impl FileSystem {
             None => return Err(format!("File '{}' does not exist", path)),
         }
 
-        let storage = Self::get_storage()
-            .ok_or_else(|| "Local storage not available".to_string())?;
-        
-        let key = content_key(&path);
-        storage.get_item(&key)
-            .map_err(|e| format!("Failed to read file: {:?}", e))?
+        if let Some(storage) = Self::get_storage() {
+            let key = content_key(&path);
+            if let Ok(Some(content)) = storage.get_item(&key) {
+                return Ok(content);
+            }
+        }
+
+        self.contents
+            .get(&path)
+            .cloned()
             .ok_or_else(|| format!("File content not found for '{}'", path))
     }
 
@@ -359,11 +372,13 @@ impl FileSystem {
                 }
 
                 for child_path in paths_to_delete {
+                    self.contents.remove(&child_path);
                     self.files.remove(&child_path);
                 }
             }
         } else {
             // Delete file content
+            self.contents.remove(&path);
             if let Some(storage) = Self::get_storage() {
                 let key = content_key(&path);
                 let _ = storage.remove_item(&key);
@@ -408,12 +423,11 @@ impl FileSystem {
             ..metadata
         });
 
-        let storage = Self::get_storage();
-
         // A directory carries its whole subtree with it; without this the
         // children keep their old keys and become unreachable orphans.
         if is_directory {
-            for (child_path, relative) in self.descendants_of(&old_path) {
+            let children: Vec<_> = self.descendants_of(&old_path);
+            for (child_path, relative) in children {
                 let child_new_path = format!("{}/{}", new_path, relative);
                 let child = self.files.remove(&child_path).unwrap();
                 let is_file = matches!(child.file_type, FileType::File);
@@ -421,13 +435,11 @@ impl FileSystem {
                 self.files.insert(child_new_path.clone(), child);
 
                 if is_file {
-                    if let Some(storage) = &storage {
-                        Self::move_content(storage, &child_path, &child_new_path, false);
-                    }
+                    Self::move_content(self, &child_path, &child_new_path, false);
                 }
             }
-        } else if let Some(storage) = &storage {
-            Self::move_content(storage, &old_path, &new_path, false);
+        } else {
+            Self::move_content(self, &old_path, &new_path, false);
         }
 
         self.save()?;
@@ -466,12 +478,11 @@ impl FileSystem {
             ..src_metadata
         });
 
-        let storage = Self::get_storage();
-
         // Copying a directory has to duplicate the whole subtree, otherwise the
         // destination is an empty shell.
         if is_directory {
-            for (child_path, relative) in self.descendants_of(&src_path) {
+            let children: Vec<_> = self.descendants_of(&src_path);
+            for (child_path, relative) in children {
                 let child_dest_path = format!("{}/{}", dest_path, relative);
                 let child = self.files.get(&child_path).unwrap().clone();
                 let is_file = matches!(child.file_type, FileType::File);
@@ -483,13 +494,11 @@ impl FileSystem {
                 });
 
                 if is_file {
-                    if let Some(storage) = &storage {
-                        Self::move_content(storage, &child_path, &child_dest_path, true);
-                    }
+                    Self::move_content(self, &child_path, &child_dest_path, true);
                 }
             }
-        } else if let Some(storage) = &storage {
-            Self::move_content(storage, &src_path, &dest_path, true);
+        } else {
+            Self::move_content(self, &src_path, &dest_path, true);
         }
 
         self.save()?;
@@ -536,8 +545,9 @@ impl FileSystem {
         }
     }
 
-    /// Every descendant of `path`, as (current_path, path_relative_to_dir).
-    fn descendants_of(&self, path: &str) -> Vec<(String, String)> {
+    /// Public for journal / agent tooling: every descendant of `path`.
+    pub fn descendants_of(&self, path: &str) -> Vec<(String, String)> {
+        let path = Self::normalize_path(path);
         let prefix = format!("{}/", path);
         self.files
             .keys()
@@ -555,14 +565,22 @@ impl FileSystem {
         dest == src || dest.starts_with(&format!("{}/", src))
     }
 
-    fn move_content(storage: &Storage, from: &str, to: &str, keep_source: bool) {
-        let from_key = content_key(from);
-        let to_key = content_key(to);
-
-        if let Ok(Some(content)) = storage.get_item(&from_key) {
-            let _ = storage.set_item(&to_key, &content);
+    fn move_content(fs: &mut FileSystem, from: &str, to: &str, keep_source: bool) {
+        if let Some(content) = fs.contents.get(from).cloned() {
+            fs.contents.insert(to.to_string(), content);
             if !keep_source {
-                let _ = storage.remove_item(&from_key);
+                fs.contents.remove(from);
+            }
+        }
+
+        if let Some(storage) = Self::get_storage() {
+            let from_key = content_key(from);
+            let to_key = content_key(to);
+            if let Ok(Some(content)) = storage.get_item(&from_key) {
+                let _ = storage.set_item(&to_key, &content);
+                if !keep_source {
+                    let _ = storage.remove_item(&from_key);
+                }
             }
         }
     }
@@ -593,7 +611,10 @@ mod tests {
             });
         }
 
-        FileSystem { files }
+        FileSystem {
+            files,
+            contents: HashMap::new(),
+        }
     }
 
     fn sorted_paths(fs: &FileSystem) -> Vec<String> {

@@ -6,14 +6,18 @@ use web_sys::{HtmlInputElement, HtmlTextAreaElement, KeyboardEvent};
 
 use crate::agent::{
     load_api_key, run_agent_loop, save_api_key, stream_completion, tool_definitions, ChatRequest,
-    LoopConfig, LoopEvent, LoopStopReason, SseEvent, StreamError, TranscriptTurn, TurnAccumulator,
-    UsageAccum,
+    FileDelta, Journal, LoopConfig, LoopEvent, LoopStopReason, PathState, SseEvent, StreamError,
+    TranscriptTurn, TurnAccumulator, UsageAccum,
 };
 use crate::filesystem::FileSystem;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct AgentProps {
     pub fs: Rc<RefCell<FileSystem>>,
+    /// Bumped by Desktop when the VFS changes so sibling apps (editor, explorer)
+    /// can re-read. Agent emits via `on_vfs_mutated` after mutating tools / undo.
+    #[prop_or_default]
+    pub on_vfs_mutated: Callback<()>,
 }
 
 pub struct Agent {
@@ -28,6 +32,11 @@ pub struct Agent {
     streaming: bool,
     abort: Option<web_sys::AbortController>,
     reasoning_open: Vec<bool>,
+    /// Diff panels open per (turn_idx, path).
+    diff_open: Vec<(usize, String)>,
+    journal: Rc<RefCell<Journal>>,
+    /// True after a run that left a non-empty set of changed paths.
+    undo_available: bool,
 }
 
 pub enum AgentMsg {
@@ -35,6 +44,9 @@ pub enum AgentMsg {
     SetApiKey(String),
     Submit,
     Stop,
+    UndoRun,
+    RevertPath(String),
+    ToggleDiff { turn: usize, path: String },
     Delta { content: String, reasoning: String },
     Turn(TranscriptTurn),
     Usage(UsageAccum),
@@ -62,6 +74,9 @@ impl Component for Agent {
             streaming: false,
             abort: None,
             reasoning_open: Vec::new(),
+            diff_open: Vec::new(),
+            journal: Rc::new(RefCell::new(Journal::new())),
+            undo_available: false,
         }
     }
 
@@ -87,12 +102,15 @@ impl Component for Agent {
 
                 self.transcript.clear();
                 self.reasoning_open.clear();
+                self.diff_open.clear();
                 self.live_content.clear();
                 self.live_reasoning.clear();
                 self.usage = UsageAccum::default();
                 self.status = None;
                 self.error = None;
                 self.streaming = true;
+                self.undo_available = false;
+                *self.journal.borrow_mut() = Journal::new();
 
                 let abort = web_sys::AbortController::new().expect("AbortController");
                 self.abort = Some(abort.clone());
@@ -101,6 +119,7 @@ impl Component for Agent {
                 let api_key = self.api_key.clone();
                 let prompt = self.prompt.clone();
                 let fs = Rc::clone(&ctx.props().fs);
+                let journal = Rc::clone(&self.journal);
 
                 wasm_bindgen_futures::spawn_local(async move {
                     let tools = tool_definitions();
@@ -113,6 +132,7 @@ impl Component for Agent {
 
                     let outcome = run_agent_loop(
                         &fs,
+                        &journal,
                         &mut request,
                         &config,
                         || abort_flag.signal().aborted(),
@@ -181,7 +201,57 @@ impl Component for Agent {
                 if let Some(abort) = &self.abort {
                     abort.abort();
                 }
-                // Leave streaming=true until StreamEnd so Submit cannot race.
+                true
+            }
+            AgentMsg::UndoRun => {
+                if self.streaming || !self.undo_available {
+                    return false;
+                }
+                let mut fs = ctx.props().fs.borrow_mut();
+                let journal = self.journal.borrow();
+                match journal.revert(&mut fs) {
+                    Ok(()) => {
+                        drop(journal);
+                        *self.journal.borrow_mut() = Journal::new();
+                        self.undo_available = false;
+                        self.status = Some("Undid agent run".into());
+                        self.error = None;
+                        ctx.props().on_vfs_mutated.emit(());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Undo failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::RevertPath(path) => {
+                if self.streaming {
+                    return false;
+                }
+                let mut fs = ctx.props().fs.borrow_mut();
+                let mut journal = self.journal.borrow_mut();
+                match journal.revert_path(&mut fs, &path) {
+                    Ok(()) => {
+                        self.undo_available = !journal.changed_paths().is_empty();
+                        self.status = Some(format!("Reverted {path}"));
+                        self.error = None;
+                        drop(journal);
+                        drop(fs);
+                        ctx.props().on_vfs_mutated.emit(());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Revert failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::ToggleDiff { turn, path } => {
+                let key = (turn, path);
+                if let Some(i) = self.diff_open.iter().position(|k| k == &key) {
+                    self.diff_open.remove(i);
+                } else {
+                    self.diff_open.push(key);
+                }
                 true
             }
             AgentMsg::Delta { content, reasoning } => {
@@ -190,10 +260,14 @@ impl Component for Agent {
                 true
             }
             AgentMsg::Turn(turn) => {
+                let mutated = turn.tools.iter().any(|t| !t.changed_paths.is_empty());
                 self.live_content.clear();
                 self.live_reasoning.clear();
                 self.reasoning_open.push(false);
                 self.transcript.push(turn);
+                if mutated {
+                    ctx.props().on_vfs_mutated.emit(());
+                }
                 true
             }
             AgentMsg::Usage(u) => {
@@ -206,6 +280,7 @@ impl Component for Agent {
                 self.live_content.clear();
                 self.live_reasoning.clear();
                 self.status = status;
+                self.undo_available = !self.journal.borrow().changed_paths().is_empty();
                 if let Err(e) = result {
                     if !matches!(e, StreamError::Aborted) {
                         self.error = Some(e.user_message().to_string());
@@ -242,6 +317,7 @@ impl Component for Agent {
         });
         let on_submit = ctx.link().callback(|_| AgentMsg::Submit);
         let on_stop = ctx.link().callback(|_| AgentMsg::Stop);
+        let on_undo = ctx.link().callback(|_| AgentMsg::UndoRun);
 
         let usage = &self.usage;
         let hit = usage.prompt_cache_hit_tokens;
@@ -252,6 +328,8 @@ impl Component for Agent {
         } else {
             (hit * 100) / cache_total
         };
+
+        let journal = self.journal.borrow();
 
         html! {
             <div class="agent-app">
@@ -293,6 +371,14 @@ impl Component for Agent {
                         >
                             { "Stop" }
                         </button>
+                        <button
+                            class="agent-btn agent-btn-undo"
+                            onclick={on_undo}
+                            disabled={self.streaming || !self.undo_available}
+                            title="Revert every file this run touched"
+                        >
+                            { "Undo agent run" }
+                        </button>
                     </div>
                 </div>
 
@@ -318,7 +404,9 @@ impl Component for Agent {
                         self.transcript.iter().enumerate().map(|(i, turn)| {
                             let open = self.reasoning_open.get(i).copied().unwrap_or(false);
                             let toggle = ctx.link().callback(move |_| AgentMsg::ToggleReasoning(i));
-                            render_turn(i, turn, open, toggle)
+                            let link = ctx.link().clone();
+                            let diff_open = self.diff_open.clone();
+                            render_turn(i, turn, open, toggle, &journal, &diff_open, link)
                         }).collect::<Html>()
                     }
                     if self.streaming && (!self.live_content.is_empty() || !self.live_reasoning.is_empty()) {
@@ -348,6 +436,9 @@ fn render_turn(
     turn: &TranscriptTurn,
     reasoning_open: bool,
     toggle: Callback<MouseEvent>,
+    journal: &Journal,
+    diff_open: &[(usize, String)],
+    link: yew::html::Scope<Agent>,
 ) -> Html {
     let salvaged = if turn.salvaged {
         html! { <span class="agent-salvaged">{ "salvaged" }</span> }
@@ -372,12 +463,34 @@ fn render_turn(
 
             {
                 turn.tools.iter().map(|t| {
+                    let diffs = t
+                        .changed_paths
+                        .iter()
+                        .filter_map(|p| journal.get(p).cloned())
+                        .filter(|e| e.prior != e.after)
+                        .collect::<Vec<_>>();
                     html! {
                         <div class="agent-turn-tool">
                             <div class="agent-turn-label">
                                 { format!("{}({})", t.name, t.arguments) }
                             </div>
                             <pre class="agent-turn-body agent-tool-result">{ &t.result }</pre>
+                            {
+                                diffs.into_iter().map(|delta| {
+                                    let path = delta.path.clone();
+                                    let open = diff_open.iter().any(|(ti, p)| *ti == index && p == &path);
+                                    let path_toggle = path.clone();
+                                    let path_revert = path.clone();
+                                    let toggle_diff = link.callback(move |_| AgentMsg::ToggleDiff {
+                                        turn: index,
+                                        path: path_toggle.clone(),
+                                    });
+                                    let revert = link.callback(move |_| {
+                                        AgentMsg::RevertPath(path_revert.clone())
+                                    });
+                                    render_file_diff(&delta, open, toggle_diff, revert)
+                                }).collect::<Html>()
+                            }
                         </div>
                     }
                 }).collect::<Html>()
@@ -391,4 +504,52 @@ fn render_turn(
             }
         </div>
     }
+}
+
+fn render_file_diff(
+    delta: &FileDelta,
+    open: bool,
+    toggle: Callback<MouseEvent>,
+    revert: Callback<MouseEvent>,
+) -> Html {
+    let summary = format!("{}  (diff)", delta.path);
+    html! {
+        <div class="agent-file-diff">
+            <div class="agent-file-diff-bar">
+                <button type="button" class="agent-turn-label agent-turn-toggle" onclick={toggle}>
+                    { if open { format!("▾ {summary}") } else { format!("▸ {summary}") } }
+                </button>
+                <button
+                    type="button"
+                    class="agent-btn agent-btn-revert"
+                    onclick={revert}
+                    title={format!("Revert {}", delta.path)}
+                >
+                    { "Revert" }
+                </button>
+            </div>
+            if open {
+                <pre class="agent-turn-body agent-diff-body">{ format_diff(delta) }</pre>
+            }
+        </div>
+    }
+}
+
+fn format_diff(delta: &FileDelta) -> String {
+    let prior = path_state_lines(&delta.prior);
+    let after = path_state_lines(&delta.after);
+    let mut out = String::new();
+    out.push_str(&format!("--- {}\n", delta.path));
+    out.push_str(&format!("+++ {}\n", delta.path));
+    for line in &prior {
+        out.push_str(&format!("- {line}\n"));
+    }
+    for line in &after {
+        out.push_str(&format!("+ {line}\n"));
+    }
+    out
+}
+
+fn path_state_lines(state: &PathState) -> Vec<String> {
+    state.display_body().lines().map(|l| l.to_string()).collect()
 }
