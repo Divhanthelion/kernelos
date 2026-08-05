@@ -5,9 +5,11 @@ use yew::prelude::*;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement, KeyboardEvent};
 
 use crate::agent::{
-    load_api_key, run_agent_loop, save_api_key, stream_completion, tool_definitions, ChatRequest,
-    FileDelta, Journal, LoopConfig, LoopEvent, LoopStopReason, PathState, SseEvent, StreamError,
-    TranscriptTurn, TurnAccumulator, UsageAccum,
+    diff_against_trunk, load_api_key, promote_all, promote_path, prompt_branch_name,
+    prompt_restore_name, run_agent_loop, save_api_key, stream_completion, tool_definitions,
+    Branch, BranchDiff, ChatRequest, FileDelta, Journal, LoopConfig, LoopEvent, LoopStopReason,
+    PathState, RestorePointStore, SseEvent, StreamError, TranscriptTurn, TurnAccumulator,
+    UsageAccum, WorkspaceId,
 };
 use crate::filesystem::FileSystem;
 
@@ -37,6 +39,12 @@ pub struct Agent {
     journal: Rc<RefCell<Journal>>,
     /// True after a run that left a non-empty set of changed paths.
     undo_available: bool,
+    restore_points: RestorePointStore,
+    /// Session-scoped RAM forks. Never persisted.
+    branches: Vec<Branch>,
+    active: WorkspaceId,
+    /// Diff panel open for branch↔trunk paths.
+    branch_diff_open: Vec<String>,
 }
 
 pub enum AgentMsg {
@@ -45,6 +53,15 @@ pub enum AgentMsg {
     Submit,
     Stop,
     UndoRun,
+    SaveRestorePoint,
+    RestorePoint(String),
+    DeleteRestorePoint(String),
+    ForkBranch,
+    SwitchWorkspace(WorkspaceId),
+    DiscardBranch(String),
+    PromoteAll,
+    PromotePath(String),
+    ToggleBranchDiff(String),
     RevertPath(String),
     ToggleDiff { turn: usize, path: String },
     Delta { content: String, reasoning: String },
@@ -55,6 +72,20 @@ pub enum AgentMsg {
         status: Option<String>,
     },
     ToggleReasoning(usize),
+}
+
+impl Agent {
+    fn active_fs(&self, trunk: &Rc<RefCell<FileSystem>>) -> Rc<RefCell<FileSystem>> {
+        match &self.active {
+            WorkspaceId::Trunk => Rc::clone(trunk),
+            WorkspaceId::Branch(id) => self
+                .branches
+                .iter()
+                .find(|b| b.id == *id)
+                .map(|b| Rc::clone(&b.fs))
+                .unwrap_or_else(|| Rc::clone(trunk)),
+        }
+    }
 }
 
 impl Component for Agent {
@@ -77,6 +108,10 @@ impl Component for Agent {
             diff_open: Vec::new(),
             journal: Rc::new(RefCell::new(Journal::new())),
             undo_available: false,
+            restore_points: RestorePointStore::load(),
+            branches: Vec::new(),
+            active: WorkspaceId::Trunk,
+            branch_diff_open: Vec::new(),
         }
     }
 
@@ -118,7 +153,7 @@ impl Component for Agent {
                 let link = ctx.link().clone();
                 let api_key = self.api_key.clone();
                 let prompt = self.prompt.clone();
-                let fs = Rc::clone(&ctx.props().fs);
+                let fs = self.active_fs(&ctx.props().fs);
                 let journal = Rc::clone(&self.journal);
 
                 wasm_bindgen_futures::spawn_local(async move {
@@ -228,7 +263,8 @@ impl Component for Agent {
                 if self.streaming || !self.undo_available {
                     return false;
                 }
-                let mut fs = ctx.props().fs.borrow_mut();
+                let fs_rc = self.active_fs(&ctx.props().fs);
+                let mut fs = fs_rc.borrow_mut();
                 let journal = self.journal.borrow();
                 match journal.revert(&mut fs) {
                     Ok(()) => {
@@ -237,7 +273,10 @@ impl Component for Agent {
                         self.undo_available = false;
                         self.status = Some("Undid agent run".into());
                         self.error = None;
-                        ctx.props().on_vfs_mutated.emit(());
+                        drop(fs);
+                        if matches!(self.active, WorkspaceId::Trunk) {
+                            ctx.props().on_vfs_mutated.emit(());
+                        }
                     }
                     Err(e) => {
                         self.error = Some(format!("Undo failed: {e}"));
@@ -245,11 +284,207 @@ impl Component for Agent {
                 }
                 true
             }
-            AgentMsg::RevertPath(path) => {
+            AgentMsg::SaveRestorePoint => {
+                if self.streaming {
+                    return false;
+                }
+                let default = chrono_ish_default_name();
+                let Some(name) = prompt_restore_name(&default) else {
+                    return false;
+                };
+                // Restore points always snapshot trunk, not the active branch.
+                let fs = ctx.props().fs.borrow();
+                match self.restore_points.save_point(&fs, &name) {
+                    Ok(point) => {
+                        self.status = Some(format!("Saved restore point “{}”", point.name));
+                        self.error = None;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Save restore point failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::RestorePoint(id) => {
                 if self.streaming {
                     return false;
                 }
                 let mut fs = ctx.props().fs.borrow_mut();
+                match self.restore_points.restore(&mut fs, &id) {
+                    Ok(()) => {
+                        *self.journal.borrow_mut() = Journal::new();
+                        self.undo_available = false;
+                        self.active = WorkspaceId::Trunk;
+                        let label = self
+                            .restore_points
+                            .get(&id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or(id);
+                        self.status = Some(format!("Restored “{label}” on trunk"));
+                        self.error = None;
+                        drop(fs);
+                        ctx.props().on_vfs_mutated.emit(());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Restore failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::DeleteRestorePoint(id) => {
+                if self.streaming {
+                    return false;
+                }
+                match self.restore_points.delete(&id) {
+                    Ok(true) => {
+                        self.status = Some("Deleted restore point".into());
+                        self.error = None;
+                    }
+                    Ok(false) => {
+                        self.error = Some("Restore point not found".into());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Delete restore point failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::ForkBranch => {
+                if self.streaming {
+                    return false;
+                }
+                let Some(name) = prompt_branch_name("experiment") else {
+                    return false;
+                };
+                let trunk = ctx.props().fs.borrow();
+                match Branch::from_trunk(&trunk, &name) {
+                    Ok(branch) => {
+                        let id = branch.id.clone();
+                        let label = branch.name.clone();
+                        self.branches.push(branch);
+                        self.active = WorkspaceId::Branch(id);
+                        *self.journal.borrow_mut() = Journal::new();
+                        self.undo_available = false;
+                        self.branch_diff_open.clear();
+                        self.status = Some(format!("Forked branch “{label}” (RAM only)"));
+                        self.error = None;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Fork failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::SwitchWorkspace(id) => {
+                if self.streaming {
+                    return false;
+                }
+                if let WorkspaceId::Branch(ref bid) = id {
+                    if !self.branches.iter().any(|b| b.id == *bid) {
+                        self.error = Some("Branch not found".into());
+                        return true;
+                    }
+                }
+                self.active = id;
+                *self.journal.borrow_mut() = Journal::new();
+                self.undo_available = false;
+                self.branch_diff_open.clear();
+                self.status = Some(match &self.active {
+                    WorkspaceId::Trunk => "Switched to trunk".into(),
+                    WorkspaceId::Branch(id) => {
+                        let name = self
+                            .branches
+                            .iter()
+                            .find(|b| b.id == *id)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| id.clone());
+                        format!("Switched to branch “{name}”")
+                    }
+                });
+                true
+            }
+            AgentMsg::DiscardBranch(id) => {
+                if self.streaming {
+                    return false;
+                }
+                self.branches.retain(|b| b.id != id);
+                if matches!(&self.active, WorkspaceId::Branch(active) if active == &id) {
+                    self.active = WorkspaceId::Trunk;
+                    *self.journal.borrow_mut() = Journal::new();
+                    self.undo_available = false;
+                }
+                self.branch_diff_open.clear();
+                self.status = Some("Discarded branch".into());
+                true
+            }
+            AgentMsg::PromoteAll => {
+                if self.streaming {
+                    return false;
+                }
+                let WorkspaceId::Branch(id) = &self.active else {
+                    self.error = Some("Switch to a branch to promote".into());
+                    return true;
+                };
+                let Some(branch) = self.branches.iter().find(|b| b.id == *id) else {
+                    self.error = Some("Branch not found".into());
+                    return true;
+                };
+                let branch_fs = Rc::clone(&branch.fs);
+                let mut trunk = ctx.props().fs.borrow_mut();
+                match promote_all(&mut trunk, &branch_fs.borrow()) {
+                    Ok(n) => {
+                        self.status = Some(format!("Promoted {n} path(s) to trunk"));
+                        self.error = None;
+                        drop(trunk);
+                        ctx.props().on_vfs_mutated.emit(());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Promote failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::PromotePath(path) => {
+                if self.streaming {
+                    return false;
+                }
+                let WorkspaceId::Branch(id) = &self.active else {
+                    self.error = Some("Switch to a branch to cherry-pick".into());
+                    return true;
+                };
+                let Some(branch) = self.branches.iter().find(|b| b.id == *id) else {
+                    self.error = Some("Branch not found".into());
+                    return true;
+                };
+                let branch_fs = Rc::clone(&branch.fs);
+                let mut trunk = ctx.props().fs.borrow_mut();
+                match promote_path(&mut trunk, &branch_fs.borrow(), &path) {
+                    Ok(()) => {
+                        self.status = Some(format!("Cherry-picked {path} → trunk"));
+                        self.error = None;
+                        drop(trunk);
+                        ctx.props().on_vfs_mutated.emit(());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Cherry-pick failed: {e}"));
+                    }
+                }
+                true
+            }
+            AgentMsg::ToggleBranchDiff(path) => {
+                if let Some(i) = self.branch_diff_open.iter().position(|p| p == &path) {
+                    self.branch_diff_open.remove(i);
+                } else {
+                    self.branch_diff_open.push(path);
+                }
+                true
+            }
+            AgentMsg::RevertPath(path) => {
+                if self.streaming {
+                    return false;
+                }
+                let fs_rc = self.active_fs(&ctx.props().fs);
+                let mut fs = fs_rc.borrow_mut();
                 let mut journal = self.journal.borrow_mut();
                 match journal.revert_path(&mut fs, &path) {
                     Ok(()) => {
@@ -258,7 +493,9 @@ impl Component for Agent {
                         self.error = None;
                         drop(journal);
                         drop(fs);
-                        ctx.props().on_vfs_mutated.emit(());
+                        if matches!(self.active, WorkspaceId::Trunk) {
+                            ctx.props().on_vfs_mutated.emit(());
+                        }
                     }
                     Err(e) => {
                         self.error = Some(format!("Revert failed: {e}"));
@@ -286,7 +523,7 @@ impl Component for Agent {
                 self.live_reasoning.clear();
                 self.reasoning_open.push(false);
                 self.transcript.push(turn);
-                if mutated {
+                if mutated && matches!(self.active, WorkspaceId::Trunk) {
                     ctx.props().on_vfs_mutated.emit(());
                 }
                 true
@@ -319,8 +556,7 @@ impl Component for Agent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let on_prompt = ctx.link().callback(|e: InputEvent| {
-            let input: HtmlTextAreaElement = e.target_unchecked_into();
+        let on_prompt = ctx.link().callback(|e: InputEvent| {            let input: HtmlTextAreaElement = e.target_unchecked_into();
             AgentMsg::SetPrompt(input.value())
         });
         let on_key_submit = {
@@ -339,6 +575,10 @@ impl Component for Agent {
         let on_submit = ctx.link().callback(|_| AgentMsg::Submit);
         let on_stop = ctx.link().callback(|_| AgentMsg::Stop);
         let on_undo = ctx.link().callback(|_| AgentMsg::UndoRun);
+        let on_save_point = ctx.link().callback(|_| AgentMsg::SaveRestorePoint);
+        let on_fork = ctx.link().callback(|_| AgentMsg::ForkBranch);
+        let on_promote_all = ctx.link().callback(|_| AgentMsg::PromoteAll);
+        let on_trunk = ctx.link().callback(|_| AgentMsg::SwitchWorkspace(WorkspaceId::Trunk));
 
         let usage = &self.usage;
         let hit = usage.prompt_cache_hit_tokens;
@@ -351,6 +591,28 @@ impl Component for Agent {
         };
 
         let journal = self.journal.borrow();
+        let restore_points: Vec<_> = self.restore_points.points().to_vec();
+        let on_branch = matches!(self.active, WorkspaceId::Branch(_));
+        let branch_diffs: Vec<BranchDiff> = if let WorkspaceId::Branch(ref id) = self.active {
+            self.branches
+                .iter()
+                .find(|b| b.id == *id)
+                .map(|b| {
+                    diff_against_trunk(&b.fs.borrow(), &ctx.props().fs.borrow())
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let active_label = match &self.active {
+            WorkspaceId::Trunk => "trunk".to_string(),
+            WorkspaceId::Branch(id) => self
+                .branches
+                .iter()
+                .find(|b| b.id == *id)
+                .map(|b| format!("branch: {}", b.name))
+                .unwrap_or_else(|| "branch:?".into()),
+        };
 
         html! {
             <div class="agent-app">
@@ -377,6 +639,57 @@ impl Component for Agent {
                             disabled={self.streaming}
                         />
                     </label>
+                    <div class="agent-workspace-bar">
+                        <span class="agent-workspace-label">{ format!("Workspace: {active_label}") }</span>
+                        <button
+                            class={classes!("agent-btn", "agent-btn-ws", (!on_branch).then_some("agent-btn-ws-active"))}
+                            onclick={on_trunk}
+                            disabled={self.streaming}
+                        >
+                            { "Trunk" }
+                        </button>
+                        {
+                            self.branches.iter().map(|b| {
+                                let id = b.id.clone();
+                                let active = matches!(&self.active, WorkspaceId::Branch(a) if a == &id);
+                                let switch = ctx.link().callback({
+                                    let id = id.clone();
+                                    move |_| AgentMsg::SwitchWorkspace(WorkspaceId::Branch(id.clone()))
+                                });
+                                let discard = ctx.link().callback({
+                                    let id = id.clone();
+                                    move |_| AgentMsg::DiscardBranch(id.clone())
+                                });
+                                html! {
+                                    <span class="agent-branch-chip" key={b.id.clone()}>
+                                        <button
+                                            class={classes!("agent-btn", "agent-btn-ws", active.then_some("agent-btn-ws-active"))}
+                                            onclick={switch}
+                                            disabled={self.streaming}
+                                        >
+                                            { b.name.clone() }
+                                        </button>
+                                        <button
+                                            class="agent-btn agent-btn-delete-point"
+                                            onclick={discard}
+                                            disabled={self.streaming}
+                                            title="Discard this RAM branch"
+                                        >
+                                            { "×" }
+                                        </button>
+                                    </span>
+                                }
+                            }).collect::<Html>()
+                        }
+                        <button
+                            class="agent-btn agent-btn-fork"
+                            onclick={on_fork}
+                            disabled={self.streaming}
+                            title="Fork trunk into a RAM-only branch"
+                        >
+                            { "Fork" }
+                        </button>
+                    </div>
                     <div class="agent-buttons">
                         <button
                             class="agent-btn agent-btn-primary"
@@ -392,6 +705,24 @@ impl Component for Agent {
                         >
                             { "Stop" }
                         </button>
+                        <button
+                            class="agent-btn agent-btn-save-point"
+                            onclick={on_save_point}
+                            disabled={self.streaming}
+                            title="Snapshot trunk under a name"
+                        >
+                            { "Save restore point" }
+                        </button>
+                        if on_branch {
+                            <button
+                                class="agent-btn agent-btn-promote"
+                                onclick={on_promote_all}
+                                disabled={self.streaming || branch_diffs.is_empty()}
+                                title="Copy all branch changes onto trunk"
+                            >
+                                { "Promote all → trunk" }
+                            </button>
+                        }
                         if self.undo_available {
                             <button
                                 class="agent-btn agent-btn-undo"
@@ -404,6 +735,88 @@ impl Component for Agent {
                         }
                     </div>
                 </div>
+
+                if on_branch && !branch_diffs.is_empty() {
+                    <div class="agent-branch-diff">
+                        <div class="agent-restore-points-label">{ "Diff vs trunk" }</div>
+                        {
+                            branch_diffs.into_iter().map(|d| {
+                                let path = d.path.clone();
+                                let open = self.branch_diff_open.iter().any(|p| p == &path);
+                                let toggle = ctx.link().callback({
+                                    let path = path.clone();
+                                    move |_| AgentMsg::ToggleBranchDiff(path.clone())
+                                });
+                                let promote = ctx.link().callback({
+                                    let path = path.clone();
+                                    move |_| AgentMsg::PromotePath(path.clone())
+                                });
+                                html! {
+                                    <div class="agent-file-diff" key={d.path.clone()}>
+                                        <div class="agent-file-diff-bar">
+                                            <button type="button" class="agent-turn-label agent-turn-toggle" onclick={toggle}>
+                                                { if open { format!("▾ {}", d.path) } else { format!("▸ {}", d.path) } }
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="agent-btn agent-btn-restore"
+                                                onclick={promote}
+                                                disabled={self.streaming}
+                                                title="Cherry-pick this path onto trunk"
+                                            >
+                                                { "Cherry-pick" }
+                                            </button>
+                                        </div>
+                                        if open {
+                                            <pre class="agent-turn-body agent-diff-body">{
+                                                format_branch_diff(&d)
+                                            }</pre>
+                                        }
+                                    </div>
+                                }
+                            }).collect::<Html>()
+                        }
+                    </div>
+                }
+
+                if !restore_points.is_empty() {
+                    <div class="agent-restore-points">
+                        <div class="agent-restore-points-label">{ "Restore points" }</div>
+                        {
+                            restore_points.into_iter().rev().map(|point| {
+                                let id_restore = point.id.clone();
+                                let id_delete = point.id.clone();
+                                let on_restore = ctx.link().callback(move |_| {
+                                    AgentMsg::RestorePoint(id_restore.clone())
+                                });
+                                let on_delete = ctx.link().callback(move |_| {
+                                    AgentMsg::DeleteRestorePoint(id_delete.clone())
+                                });
+                                html! {
+                                    <div class="agent-restore-point" key={point.id.clone()}>
+                                        <span class="agent-restore-point-name">{ point.name.clone() }</span>
+                                        <button
+                                            class="agent-btn agent-btn-restore"
+                                            onclick={on_restore}
+                                            disabled={self.streaming}
+                                            title="Replace trunk with this snapshot"
+                                        >
+                                            { "Restore" }
+                                        </button>
+                                        <button
+                                            class="agent-btn agent-btn-delete-point"
+                                            onclick={on_delete}
+                                            disabled={self.streaming}
+                                            title="Delete this restore point"
+                                        >
+                                            { "Delete" }
+                                        </button>
+                                    </div>
+                                }
+                            }).collect::<Html>()
+                        }
+                    </div>
+                }
 
                 <div class="agent-usage">
                     <span>{ format!("cache hit {hit}") }</span>
@@ -575,4 +988,38 @@ fn format_diff(delta: &FileDelta) -> String {
 
 fn path_state_lines(state: &PathState) -> Vec<String> {
     state.display_body().lines().map(|l| l.to_string()).collect()
+}
+
+fn format_branch_diff(d: &BranchDiff) -> String {
+    let prior = path_state_lines(&d.trunk);
+    let after = path_state_lines(&d.branch);
+    let mut out = String::new();
+    out.push_str(&format!("--- trunk:{}\n", d.path));
+    out.push_str(&format!("+++ branch:{}\n", d.path));
+    for line in &prior {
+        out.push_str(&format!("- {line}\n"));
+    }
+    for line in &after {
+        out.push_str(&format!("+ {line}\n"));
+    }
+    out
+}
+
+fn chrono_ish_default_name() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new_0();
+        format!(
+            "point {}-{:02}-{:02} {:02}:{:02}",
+            d.get_full_year(),
+            d.get_month() + 1,
+            d.get_date(),
+            d.get_hours(),
+            d.get_minutes()
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "restore point".into()
+    }
 }

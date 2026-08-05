@@ -18,7 +18,7 @@ pub fn is_protected_path(path: &str) -> bool {
 }
 
 /// Prior (and after) state of one path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PathState {
     /// Path did not exist.
     Absent,
@@ -259,7 +259,9 @@ impl Journal {
     }
 }
 
-fn restore_path(fs: &mut FileSystem, path: &str, prior: &PathState) -> Result<(), String> {
+/// Apply a captured path state onto the live filesystem (used by undo and
+/// named restore points).
+pub(crate) fn restore_path(fs: &mut FileSystem, path: &str, prior: &PathState) -> Result<(), String> {
     match prior {
         PathState::Absent => {
             if fs.exists(path) {

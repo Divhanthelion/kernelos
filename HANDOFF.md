@@ -36,14 +36,13 @@ Single-file Python acceptance can look green with a *stale* module cache
 
 ## OPEN — ordered
 
-### 1 — M7a Named restore points (next)
-Promote M4’s journal into named snapshots you can restore. Cap count/size;
-prefer deltas. See PLAN §3a. Does not need OPFS.
+### 1 — M7a Named restore points ✅
+`src/agent/restore.rs` + Agent UI. See PLAN §3a.
 
-### 2 — M7b User-directed forks
-RAM forks with user-supplied divergence (different prompt / seeds / files);
-diff vs trunk; keep / discard / cherry-pick. Persistent HAMT optional but
-likely. Automatic identical-prompt fanout is **out**.
+### 2 — M7b User-directed forks ✅ IMPLEMENTED (pending commit with M7a)
+`FileSystem::persist` + `fork_ephemeral`; `src/agent/branch.rs`; Agent
+workspace bar (Fork / switch / discard), Diff vs trunk, Promote all,
+Cherry-pick. 100 tests.
 
 ### 3 — M6 respec — ruff (optional)
 `@astral-sh/ruff-wasm-web` as a tool — not a WASI host.

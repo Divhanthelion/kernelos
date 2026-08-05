@@ -32,10 +32,19 @@ pub struct FileSystem {
     files: HashMap<String, FileMetadata>,
     /// In-memory file bodies. Always updated on write so the VFS remains a
     /// complete value when localStorage is unavailable (host tests). Mirrored
-    /// to `content_key()` in localStorage when storage is present. Skipped in
-    /// the metadata JSON blob — bodies live under their own keys.
+    /// to `content_key()` in localStorage when storage is present *and*
+    /// `persist` is true. Skipped in the metadata JSON blob — bodies live
+    /// under their own keys.
     #[serde(skip)]
     contents: HashMap<String, String>,
+    /// When false, this filesystem is an ephemeral RAM branch: mutations never
+    /// touch localStorage, and reads prefer `contents` over trunk's storage.
+    #[serde(skip, default = "default_persist")]
+    persist: bool,
+}
+
+fn default_persist() -> bool {
+    true
 }
 
 impl Default for FileSystem {
@@ -43,6 +52,7 @@ impl Default for FileSystem {
         Self::new().unwrap_or_else(|_| FileSystem {
             files: HashMap::new(),
             contents: HashMap::new(),
+            persist: true,
         })
     }
 }
@@ -53,7 +63,8 @@ impl FileSystem {
         if let Some(storage) = Self::get_storage() {
             if let Ok(Some(data)) = storage.get_item(FS_STORAGE_KEY) {
                 if !data.is_empty() {
-                    if let Ok(fs) = serde_json::from_str::<FileSystem>(&data) {
+                    if let Ok(mut fs) = serde_json::from_str::<FileSystem>(&data) {
+                        fs.persist = true;
                         return Ok(fs);
                     }
                     log::warn!("Failed to parse saved filesystem, creating new one");
@@ -65,6 +76,7 @@ impl FileSystem {
         let mut fs = FileSystem {
             files: HashMap::new(),
             contents: HashMap::new(),
+            persist: true,
         };
         
         fs.initialize_default_structure()?;
@@ -164,12 +176,14 @@ impl FileSystem {
             modified: timestamp,
         });
 
-        // Store content in memory (always) and localStorage (when available).
+        // Store content in memory (always) and localStorage (when durable).
         self.contents.insert(path.clone(), content.to_string());
-        if let Some(storage) = Self::get_storage() {
-            let key = content_key(&path);
-            storage.set_item(&key, content)
-                .map_err(|e| format!("Failed to write file content: {:?}", e))?;
+        if self.persist {
+            if let Some(storage) = Self::get_storage() {
+                let key = content_key(&path);
+                storage.set_item(&key, content)
+                    .map_err(|e| format!("Failed to write file content: {:?}", e))?;
+            }
         }
 
         Ok(())
@@ -202,8 +216,12 @@ impl FileSystem {
 
     /// Persist metadata to local storage. When storage is unavailable — private
     /// browsing, or a non-browser host such as the test runner — the filesystem
-    /// degrades to in-memory rather than failing every operation.
+    /// degrades to in-memory rather than failing every operation. Ephemeral
+    /// branches (`persist == false`) never write.
     pub fn save(&self) -> Result<(), String> {
+        if !self.persist {
+            return Ok(());
+        }
         let Some(storage) = Self::get_storage() else {
             return Ok(());
         };
@@ -215,6 +233,31 @@ impl FileSystem {
             .map_err(|e| format!("Failed to save filesystem: {:?}", e))?;
 
         Ok(())
+    }
+
+    /// Whether mutations are written through to localStorage (trunk) or stay
+    /// in RAM only (branch).
+    pub fn is_persistent(&self) -> bool {
+        self.persist
+    }
+
+    /// Deep-clone this filesystem into an ephemeral RAM branch. File bodies are
+    /// hydrated into `contents` so the branch never reads trunk's localStorage
+    /// keys. Does not require a persistent HAMT for v1 — clone cost is
+    /// O(filesystem), fine while trunks stay small.
+    pub fn fork_ephemeral(&self) -> Result<Self, String> {
+        let mut contents = HashMap::new();
+        for (path, meta) in &self.files {
+            if matches!(meta.file_type, FileType::File) {
+                let body = self.read_file(path)?;
+                contents.insert(path.clone(), body);
+            }
+        }
+        Ok(Self {
+            files: self.files.clone(),
+            contents,
+            persist: false,
+        })
     }
 
     pub fn list_directory(&self, path: &str) -> Result<Vec<FileMetadata>, String> {
@@ -320,10 +363,13 @@ impl FileSystem {
             None => return Err(format!("File '{}' does not exist", path)),
         }
 
-        if let Some(storage) = Self::get_storage() {
-            let key = content_key(&path);
-            if let Ok(Some(content)) = storage.get_item(&key) {
-                return Ok(content);
+        // Ephemeral branches must not read trunk localStorage under the same keys.
+        if self.persist {
+            if let Some(storage) = Self::get_storage() {
+                let key = content_key(&path);
+                if let Ok(Some(content)) = storage.get_item(&key) {
+                    return Ok(content);
+                }
             }
         }
 
@@ -360,12 +406,14 @@ impl FileSystem {
                     .cloned()
                     .collect();
 
-                if let Some(storage) = Self::get_storage() {
-                    for child_path in &paths_to_delete {
-                        if let Some(child_meta) = self.files.get(child_path) {
-                            if matches!(child_meta.file_type, FileType::File) {
-                                let key = content_key(child_path);
-                                let _ = storage.remove_item(&key);
+                if self.persist {
+                    if let Some(storage) = Self::get_storage() {
+                        for child_path in &paths_to_delete {
+                            if let Some(child_meta) = self.files.get(child_path) {
+                                if matches!(child_meta.file_type, FileType::File) {
+                                    let key = content_key(child_path);
+                                    let _ = storage.remove_item(&key);
+                                }
                             }
                         }
                     }
@@ -379,9 +427,11 @@ impl FileSystem {
         } else {
             // Delete file content
             self.contents.remove(&path);
-            if let Some(storage) = Self::get_storage() {
-                let key = content_key(&path);
-                let _ = storage.remove_item(&key);
+            if self.persist {
+                if let Some(storage) = Self::get_storage() {
+                    let key = content_key(&path);
+                    let _ = storage.remove_item(&key);
+                }
             }
         }
 
@@ -510,6 +560,11 @@ impl FileSystem {
         self.files.contains_key(&path)
     }
 
+    /// Every path currently in the metadata map (files and directories).
+    pub fn all_paths(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
+
     pub fn is_directory(&self, path: &str) -> bool {
         let path = Self::normalize_path(path);
         self.files.get(&path)
@@ -573,13 +628,15 @@ impl FileSystem {
             }
         }
 
-        if let Some(storage) = Self::get_storage() {
-            let from_key = content_key(from);
-            let to_key = content_key(to);
-            if let Ok(Some(content)) = storage.get_item(&from_key) {
-                let _ = storage.set_item(&to_key, &content);
-                if !keep_source {
-                    let _ = storage.remove_item(&from_key);
+        if fs.persist {
+            if let Some(storage) = Self::get_storage() {
+                let from_key = content_key(from);
+                let to_key = content_key(to);
+                if let Ok(Some(content)) = storage.get_item(&from_key) {
+                    let _ = storage.set_item(&to_key, &content);
+                    if !keep_source {
+                        let _ = storage.remove_item(&from_key);
+                    }
                 }
             }
         }
@@ -614,6 +671,7 @@ mod tests {
         FileSystem {
             files,
             contents: HashMap::new(),
+            persist: true,
         }
     }
 
@@ -747,5 +805,20 @@ mod tests {
         assert!(!fs.exists("/home/a.txt"));
         assert!(fs.exists("/home/b.txt"));
         assert_eq!(fs.get_metadata("/home/b.txt").unwrap().name, "b.txt");
+    }
+
+    #[test]
+    fn ephemeral_fork_does_not_mutate_trunk_contents() {
+        let mut trunk = FileSystem::default();
+        trunk
+            .write_file("/home/documents/x.txt", "trunk")
+            .unwrap();
+        let mut branch = trunk.fork_ephemeral().unwrap();
+        assert!(!branch.is_persistent());
+        branch
+            .write_file("/home/documents/x.txt", "branch")
+            .unwrap();
+        assert_eq!(trunk.read_file("/home/documents/x.txt").unwrap(), "trunk");
+        assert_eq!(branch.read_file("/home/documents/x.txt").unwrap(), "branch");
     }
 }

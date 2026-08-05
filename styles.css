@@ -1777,6 +1777,94 @@
     color: #fff;
     margin-left: auto;
 }
+.agent-btn-save-point {
+    background: #34495e;
+    color: #fff;
+}
+.agent-btn-fork {
+    background: #1e8449;
+    color: #fff;
+}
+.agent-btn-promote {
+    background: #117a65;
+    color: #fff;
+}
+.agent-workspace-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+.agent-workspace-label {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-right: 4px;
+}
+.agent-btn-ws {
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--border-color, #555);
+    padding: 4px 10px;
+    font-size: 12px;
+}
+.agent-btn-ws-active {
+    background: var(--accent-primary, #4a9eff);
+    color: #fff;
+    border-color: transparent;
+}
+.agent-branch-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+.agent-branch-diff {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color, #333);
+    margin-bottom: 4px;
+}
+.agent-restore-points {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color, #333);
+    margin-bottom: 4px;
+}
+.agent-restore-points-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+}
+.agent-restore-point {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+.agent-restore-point-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.agent-btn-restore {
+    background: #1a5276;
+    color: #fff;
+    padding: 4px 10px;
+    font-size: 12px;
+}
+.agent-btn-delete-point {
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--border-color, #555);
+    padding: 4px 10px;
+    font-size: 12px;
+}
 .agent-btn-revert {
     padding: 2px 8px;
     font-size: 11px;

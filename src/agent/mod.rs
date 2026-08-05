@@ -1,9 +1,12 @@
 //! In-tab AI agent: streaming transport (M1), VFS tools (M2), multi-turn loop (M3),
-//! copy-on-write journal / undo (M4), TypeScript typecheck (M5a), Python (M5b).
+//! copy-on-write journal / undo (M4), TypeScript typecheck (M5a), Python (M5b),
+//! named restore points (M7a), user-directed forks (M7b).
 
 pub mod accum;
+pub mod branch;
 pub mod journal;
 pub mod python;
+pub mod restore;
 pub mod roundtrip;
 pub mod salvage;
 pub mod stream;
@@ -11,8 +14,16 @@ pub mod tools;
 pub mod typecheck;
 
 pub use accum::{ToolCallAccum, TurnAccumulator, UsageAccum};
+pub use branch::{
+    diff_against_trunk, promote_all, promote_path, prompt_branch_name, Branch, BranchDiff,
+    WorkspaceId,
+};
 pub use journal::{FileDelta, Journal, PathState, RECURSIVE_DELETE_GATE_THRESHOLD};
 pub use python::ensure_python_loaded;
+pub use restore::{
+    prompt_restore_name, RestorePoint, RestorePointStore, MAX_RESTORE_POINTS,
+    RESTORE_POINTS_STORAGE_KEY,
+};
 pub use roundtrip::{
     run_agent_loop, tool_round_trip, LoopConfig, LoopEvent, LoopOutcome, LoopStopReason,
     TranscriptTurn, ToolInvocation, DEFAULT_MAX_ITERATIONS, REPETITION_LIMIT,
@@ -66,6 +77,7 @@ pub fn save_api_key(_key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::API_KEY_STORAGE_KEY;
+    use crate::agent::RESTORE_POINTS_STORAGE_KEY;
     use crate::filesystem::content_key;
     use crate::plugin::imports::allow_vfs_path;
 
@@ -108,5 +120,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn restore_points_key_outside_vfs_content_prefix() {
+        assert!(
+            !RESTORE_POINTS_STORAGE_KEY.starts_with(&content_key("")),
+            "restore points must not use the VFS content prefix"
+        );
+        assert_ne!(RESTORE_POINTS_STORAGE_KEY, API_KEY_STORAGE_KEY);
     }
 }

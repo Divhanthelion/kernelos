@@ -354,43 +354,34 @@ M4’s copy-on-write journal already snapshots prior file contents. Promote that
 into first-class **named restore points**, then let the user **fork** the VFS
 to run deliberately different experiments.
 
-**M7a — Named restore points** (ship first; builds directly on M4)
+**M7a — Named restore points** ✅ (2026-08-05)
 
 - After an agent run (or on demand), save a named snapshot of trunk:
-  metadata tree + file bodies that differ from an empty baseline, or a
-  compact COW journal relative to the previous point.
-- UI: list of restore points → restore one → trunk matches that point.
-  Undo agent run remains the fast path for “revert the last run”; named
-  points are for “go back to before I tried X.”
-- Persist restore points in localStorage **sparingly** (cap count / size).
-  Prefer storing deltas (journal style), not N full trees. When quota is
-  tight, drop oldest points first.
+  every path as `PathState` (`src/agent/restore.rs`). Cap: 5 points /
+  512k serialized chars; oldest dropped first. Key:
+  `kernelosv2_restore_points` (outside the VFS).
+- UI: Save restore point / Restore / Delete in the Agent app. Undo agent
+  run remains the fast path for the last run; named points are for “go
+  back to before I tried X.” Restoring clears the run journal.
+- Persist in localStorage sparingly. Full snapshots for v1 (not relative
+  deltas yet) — still one trunk on disk plus the capped point list.
 
-*Verify:* agent edits files → save point “before refactor” → more edits →
-restore → tree matches the named point; localStorage still holds one trunk.
+*Verify:* unit tests round-trip trunk through save→mutate→restore; Agent
+UI save/restore/delete wired.
 
-**M7b — User-directed forks** (after M7a)
+**M7b — User-directed forks** ✅ (2026-08-05)
 
-- User forks trunk into a RAM branch, optionally edits the prompt / seeds /
-  files, runs the agent against that branch, diffs against trunk, then
-  **keeps, discards, or cherry-picks**.
-- Divergence comes from the **user** (different instructions, different
-  starting files), not from hoping identical prompts fan out.
-- Implementation shape (unchanged from research):
-  1. Detach branch `FileSystem` clones from write-through (today
-     `write_file_internal` always hits both stores).
-  2. Persistent map (`im_rc::HashMap` / HAMT) for O(1) fork in RAM.
-  3. Branches are session-scoped by default; **only trunk + named restore
-     points** persist. Reload may drop live forks — acceptable for v1.
-  4. If we ever fan out concurrent API calls that share a prefix: pre-flight
-     one turn before fan-out (~1.01× not ~N×). Never distinct `user_id` per
-     branch.
+- User forks trunk into a RAM branch (`FileSystem::fork_ephemeral` —
+  `persist: false`, hydrated `contents`), edits the prompt, runs the agent
+  against that branch, diffs vs trunk, then **promotes all / cherry-picks /
+  discards**.
+- Divergence comes from the **user**. Branches are session-scoped; reload
+  drops them. Trunk + named restore points remain the only persisted state.
+- Clone cost is O(filesystem) for v1 (no HAMT yet) — fine while trunks stay
+  small.
 
-Does **not** require the §2a OPFS/Worker migration. OPFS remains the path
-when trunk + restore-point deltas outgrow ~5 MiB.
-
-*Verify (M7b):* fork → different prompt on the branch → agent run → side-by-
-side diff vs trunk → promote chosen files (or whole branch) back to trunk.
+*Verify:* unit tests for isolation, diff, promote-all, cherry-pick; Agent UI
+Fork / workspace switch / Diff vs trunk / Promote / Discard.
 
 **Explicitly out of M7:** automatic N-way identical-prompt parallel runs and
 a three-way “pick a strategy” UI. Revisit only with evidence that a prompt
