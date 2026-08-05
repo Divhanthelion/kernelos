@@ -1,6 +1,6 @@
 use yew::prelude::*;
 
-use crate::apps::{self, AppDefinition};
+use crate::apps;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct StartMenuProps {

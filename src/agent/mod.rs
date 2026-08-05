@@ -1,13 +1,18 @@
-//! In-tab AI agent streaming transport (M1).
+//! In-tab AI agent streaming transport (M1) and VFS tools (M2).
 
 pub mod accum;
+pub mod roundtrip;
 pub mod stream;
+pub mod tools;
 
 pub use accum::{ToolCallAccum, TurnAccumulator};
+pub use roundtrip::tool_round_trip;
 pub use stream::{
-    stream_completion, ChatMessage, ChatRequest, SseEvent, SseParser, StreamError,
-    DEEPSEEK_API_URL,
+    stream_completion, AssistantFunctionCall, AssistantToolCall, ChatMessage, ChatRequest,
+    SseEvent, SseParser, StreamError, ThinkingConfig, DEEPSEEK_API_URL, DEEPSEEK_BETA_API_URL,
+    DEEPSEEK_MODEL,
 };
+pub use tools::{execute_tool, tool_definitions, truncate_result, MAX_TOOL_RESULT_BYTES};
 
 /// localStorage key for the DeepSeek API key. Deliberately outside the VFS —
 /// no `kernelosv2_file:` prefix, no FileSystem path.
@@ -47,16 +52,16 @@ pub fn save_api_key(_key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::API_KEY_STORAGE_KEY;
+    use crate::filesystem::content_key;
     use crate::plugin::imports::allow_vfs_path;
 
     /// VFS file bodies are stored at `kernelosv2_file:<path>`. The API key uses
     /// a separate top-level localStorage key with no VFS involvement.
-    const VFS_CONTENT_PREFIX: &str = "kernelosv2_file:";
-
     #[test]
     fn api_key_not_reachable_via_vfs_grants() {
+        // content_key("") yields the storage prefix; the key must not share it.
         assert!(
-            !API_KEY_STORAGE_KEY.starts_with(VFS_CONTENT_PREFIX),
+            !API_KEY_STORAGE_KEY.starts_with(&content_key("")),
             "API key storage key must not use the VFS content prefix"
         );
 
@@ -81,7 +86,7 @@ mod tests {
         for prefix in grant_prefixes {
             for path in probe_paths {
                 if let Some(normalized) = allow_vfs_path(prefix, path) {
-                    let vfs_storage_key = format!("{VFS_CONTENT_PREFIX}{normalized}");
+                    let vfs_storage_key = content_key(&normalized);
                     assert_ne!(
                         vfs_storage_key, API_KEY_STORAGE_KEY,
                         "grant {prefix:?} + path {path:?} would collide with API key storage"

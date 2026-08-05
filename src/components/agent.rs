@@ -1,16 +1,26 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use yew::prelude::*;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement, KeyboardEvent};
 
 use crate::agent::{
-    load_api_key, save_api_key, stream_completion, ChatRequest, SseEvent, StreamError,
-    TurnAccumulator,
+    load_api_key, save_api_key, stream_completion, tool_definitions, tool_round_trip, ChatRequest,
+    SseEvent, StreamError, TurnAccumulator,
 };
+use crate::filesystem::FileSystem;
+
+#[derive(Properties, Clone, PartialEq)]
+pub struct AgentProps {
+    pub fs: Rc<RefCell<FileSystem>>,
+}
 
 pub struct Agent {
     prompt: String,
     api_key: String,
     content: String,
     reasoning: String,
+    tool_log: String,
     error: Option<String>,
     streaming: bool,
     abort: Option<web_sys::AbortController>,
@@ -22,12 +32,13 @@ pub enum AgentMsg {
     Submit,
     Stop,
     Delta { content: String, reasoning: String },
+    ToolLog(String),
     StreamEnd(Result<(), StreamError>),
 }
 
 impl Component for Agent {
     type Message = AgentMsg;
-    type Properties = ();
+    type Properties = AgentProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
         Self {
@@ -35,6 +46,7 @@ impl Component for Agent {
             api_key: load_api_key().unwrap_or_default(),
             content: String::new(),
             reasoning: String::new(),
+            tool_log: String::new(),
             error: None,
             streaming: false,
             abort: None,
@@ -63,6 +75,7 @@ impl Component for Agent {
 
                 self.content.clear();
                 self.reasoning.clear();
+                self.tool_log.clear();
                 self.error = None;
                 self.streaming = true;
 
@@ -72,12 +85,14 @@ impl Component for Agent {
                 let link = ctx.link().clone();
                 let api_key = self.api_key.clone();
                 let prompt = self.prompt.clone();
+                let fs = Rc::clone(&ctx.props().fs);
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    let request = ChatRequest::streaming(&prompt);
+                    let tools = tool_definitions();
+                    let mut request = ChatRequest::streaming_with_tools(&prompt, tools);
                     let mut accum = TurnAccumulator::default();
 
-                    let result = stream_completion(&api_key, &request, &abort, |event| {
+                    let first = stream_completion(&api_key, &request, &abort, |event| {
                         if let SseEvent::Data(chunk) = event {
                             accum.apply_chunk(&chunk);
                             link.send_message(AgentMsg::Delta {
@@ -88,7 +103,55 @@ impl Component for Agent {
                     })
                     .await;
 
-                    link.send_message(AgentMsg::StreamEnd(result));
+                    if let Err(e) = first {
+                        link.send_message(AgentMsg::StreamEnd(Err(e)));
+                        return;
+                    }
+
+                    // Single tool round-trip (M2). Multi-turn loop is M3.
+                    let follow_up = {
+                        let mut filesystem = fs.borrow_mut();
+                        tool_round_trip(&mut filesystem, &accum)
+                    };
+
+                    let Some((assistant, tool_msgs)) = follow_up else {
+                        link.send_message(AgentMsg::StreamEnd(Ok(())));
+                        return;
+                    };
+
+                    let mut log = String::new();
+                    for (tc, result) in assistant
+                        .tool_calls
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .zip(tool_msgs.iter())
+                    {
+                        log.push_str(&format!(
+                            "{}({}) → {}\n",
+                            tc.function.name,
+                            tc.function.arguments,
+                            result.content.as_deref().unwrap_or("")
+                        ));
+                    }
+                    link.send_message(AgentMsg::ToolLog(log));
+
+                    request.messages.push(assistant);
+                    request.messages.extend(tool_msgs);
+
+                    let mut final_accum = TurnAccumulator::default();
+                    let second = stream_completion(&api_key, &request, &abort, |event| {
+                        if let SseEvent::Data(chunk) = event {
+                            final_accum.apply_chunk(&chunk);
+                            link.send_message(AgentMsg::Delta {
+                                content: final_accum.content.clone(),
+                                reasoning: final_accum.reasoning.clone(),
+                            });
+                        }
+                    })
+                    .await;
+
+                    link.send_message(AgentMsg::StreamEnd(second));
                 });
 
                 true
@@ -103,6 +166,10 @@ impl Component for Agent {
             AgentMsg::Delta { content, reasoning } => {
                 self.content = content;
                 self.reasoning = reasoning;
+                true
+            }
+            AgentMsg::ToolLog(log) => {
+                self.tool_log = log;
                 true
             }
             AgentMsg::StreamEnd(result) => {
@@ -191,6 +258,12 @@ impl Component for Agent {
                         <div class="agent-pane-header">{ "Reasoning" }</div>
                         <pre class="agent-pane-body">{ &self.reasoning }</pre>
                     </div>
+                    if !self.tool_log.is_empty() {
+                        <div class="agent-pane">
+                            <div class="agent-pane-header">{ "Tools" }</div>
+                            <pre class="agent-pane-body">{ &self.tool_log }</pre>
+                        </div>
+                    }
                     <div class="agent-pane agent-content-pane">
                         <div class="agent-pane-header">{ "Response" }</div>
                         <pre class="agent-pane-body">{ &self.content }</pre>

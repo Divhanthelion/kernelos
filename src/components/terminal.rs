@@ -34,7 +34,6 @@ enum TerminalLine {
     Command { prompt: String, command: String },
     Output(String),
     Error(String),
-    Success(String),
 }
 
 pub enum TerminalMsg {
@@ -98,12 +97,13 @@ impl Component for Terminal {
             }
             TerminalMsg::ExecuteCommand => {
                 let command = self.current_input.trim().to_string();
-                if !command.is_empty() {
-                    if self.pending_install.is_some() {
-                        self.handle_install_confirm(&command, ctx);
-                    } else {
-                        self.execute_command(&command, ctx);
-                    }
+                if self.pending_install.is_some() {
+                    // [y/N]: bare Enter means decline.
+                    self.handle_install_confirm(&command, ctx);
+                    self.current_input.clear();
+                    self.history_index = None;
+                } else if !command.is_empty() {
+                    self.execute_command(&command, ctx);
                     self.current_input.clear();
                     self.history_index = None;
                 }
@@ -238,11 +238,6 @@ impl Component for Terminal {
                                 TerminalLine::Error(text) => {
                                     html! {
                                         <div class="terminal-line-error">{ text }</div>
-                                    }
-                                }
-                                TerminalLine::Success(text) => {
-                                    html! {
-                                        <div class="terminal-line-success">{ text }</div>
                                     }
                                 }
                             }
@@ -591,6 +586,10 @@ impl Terminal {
         
         match self.fs.borrow().list_directory(&path) {
             Ok(files) => {
+                let files: Vec<_> = files
+                    .into_iter()
+                    .filter(|f| show_all || !f.name.starts_with('.'))
+                    .collect();
                 if files.is_empty() {
                     return;
                 }

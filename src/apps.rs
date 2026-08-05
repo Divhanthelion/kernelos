@@ -268,8 +268,8 @@ fn render_minesweeper(_cx: &AppContext) -> Html {
     html! { <Minesweeper /> }
 }
 
-fn render_agent(_cx: &AppContext) -> Html {
-    html! { <Agent /> }
+fn render_agent(cx: &AppContext) -> Html {
+    html! { <Agent fs={cx.fs.clone()} /> }
 }
 
 fn render_settings(cx: &AppContext) -> Html {

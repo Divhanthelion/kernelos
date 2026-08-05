@@ -22,11 +22,10 @@ enum ViewMode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum SortBy {
+pub enum SortBy {
     Name,
     Size,
     Modified,
-    Type,
 }
 
 pub enum FileExplorerMsg {
@@ -318,23 +317,18 @@ impl FileExplorer {
     fn sort_files(&mut self) {
         self.files.sort_by(|a, b| {
             // Always put directories first
-            let dir_cmp = match (&a.file_type, &b.file_type) {
+            match (&a.file_type, &b.file_type) {
                 (FileType::Directory, FileType::File) => return std::cmp::Ordering::Less,
                 (FileType::File, FileType::Directory) => return std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            };
-            
+                _ => {}
+            }
+
             let cmp = match self.sort_by {
                 SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortBy::Size => a.size.cmp(&b.size),
                 SortBy::Modified => a.modified.cmp(&b.modified),
-                SortBy::Type => {
-                    let ext_a = a.name.rsplit('.').next().unwrap_or("");
-                    let ext_b = b.name.rsplit('.').next().unwrap_or("");
-                    ext_a.cmp(ext_b)
-                }
             };
-            
+
             if self.sort_ascending { cmp } else { cmp.reverse() }
         });
     }

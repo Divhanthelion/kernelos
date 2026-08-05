@@ -33,7 +33,7 @@ use crate::plugin::abi::{
     decode_ui_ops, encode_event, Event, Grant, PermissionsStore, PluginManifest, UiOp, ABI_VERSION,
 };
 use crate::plugin::imports::{build_imports, fill_shared, InstanceShared};
-use crate::plugin::memory::{call_i32, call_void, GuestMemory};
+use crate::plugin::memory::{call_i32, call_void};
 
 pub const PERMISSIONS_PATH: &str = "/system/config/permissions.json";
 pub const APPLICATIONS_DIR: &str = "/applications";

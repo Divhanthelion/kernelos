@@ -90,14 +90,26 @@ impl Arena {
     }
 }
 
-static mut ARENA: Option<Arena> = None;
+/// Single-threaded bump arena. Held in `UnsafeCell` rather than `static mut`
+/// so we never form a reference to a mutable static (the `static_mut_refs`
+/// lint). Soundness rests on the guest being single-threaded wasm: the host
+/// does not re-enter plugin code while a host import holds `&mut Arena`, so
+/// there is no concurrent access to race against.
+struct ArenaHolder(std::cell::UnsafeCell<Option<Arena>>);
+
+// SAFETY: plugins are single-threaded wasm; see ArenaHolder comment above.
+unsafe impl Sync for ArenaHolder {}
+
+static ARENA: ArenaHolder = ArenaHolder(std::cell::UnsafeCell::new(None));
 
 fn arena() -> &'static mut Arena {
+    // SAFETY: single-threaded guest; see ArenaHolder.
     unsafe {
-        if ARENA.is_none() {
-            ARENA = Some(Arena::new());
+        let slot = &mut *ARENA.0.get();
+        if slot.is_none() {
+            *slot = Some(Arena::new());
         }
-        ARENA.as_mut().unwrap()
+        slot.as_mut().unwrap()
     }
 }
 

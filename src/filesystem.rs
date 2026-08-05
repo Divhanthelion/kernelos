@@ -6,6 +6,12 @@ use std::path::Path;
 const FS_STORAGE_KEY: &str = "kernelosv2_fs";
 const FILE_CONTENT_PREFIX: &str = "kernelosv2_file:";
 
+/// localStorage key for a VFS file body. Single source of truth — callers must
+/// not concatenate the prefix themselves.
+pub fn content_key(path: &str) -> String {
+    format!("{FILE_CONTENT_PREFIX}{path}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FileType {
     File,
@@ -152,7 +158,7 @@ impl FileSystem {
 
         // Store content
         if let Some(storage) = Self::get_storage() {
-            let key = format!("{}{}", FILE_CONTENT_PREFIX, path);
+            let key = content_key(&path);
             storage.set_item(&key, content)
                 .map_err(|e| format!("Failed to write file content: {:?}", e))?;
         }
@@ -308,7 +314,7 @@ impl FileSystem {
         let storage = Self::get_storage()
             .ok_or_else(|| "Local storage not available".to_string())?;
         
-        let key = format!("{}{}", FILE_CONTENT_PREFIX, path);
+        let key = content_key(&path);
         storage.get_item(&key)
             .map_err(|e| format!("Failed to read file: {:?}", e))?
             .ok_or_else(|| format!("File content not found for '{}'", path))
@@ -345,7 +351,7 @@ impl FileSystem {
                     for child_path in &paths_to_delete {
                         if let Some(child_meta) = self.files.get(child_path) {
                             if matches!(child_meta.file_type, FileType::File) {
-                                let key = format!("{}{}", FILE_CONTENT_PREFIX, child_path);
+                                let key = content_key(child_path);
                                 let _ = storage.remove_item(&key);
                             }
                         }
@@ -359,7 +365,7 @@ impl FileSystem {
         } else {
             // Delete file content
             if let Some(storage) = Self::get_storage() {
-                let key = format!("{}{}", FILE_CONTENT_PREFIX, path);
+                let key = content_key(&path);
                 let _ = storage.remove_item(&key);
             }
         }
@@ -550,8 +556,8 @@ impl FileSystem {
     }
 
     fn move_content(storage: &Storage, from: &str, to: &str, keep_source: bool) {
-        let from_key = format!("{}{}", FILE_CONTENT_PREFIX, from);
-        let to_key = format!("{}{}", FILE_CONTENT_PREFIX, to);
+        let from_key = content_key(from);
+        let to_key = content_key(to);
 
         if let Ok(Some(content)) = storage.get_item(&from_key) {
             let _ = storage.set_item(&to_key, &content);

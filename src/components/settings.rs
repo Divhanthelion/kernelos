@@ -1,7 +1,7 @@
 use yew::prelude::*;
 
 #[derive(Clone, PartialEq)]
-enum SettingsTab {
+pub enum SettingsTab {
     Appearance,
     Wallpaper,
     About,

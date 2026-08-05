@@ -3,13 +3,12 @@ use web_sys::{HtmlCanvasElement, CanvasRenderingContext2d, MouseEvent};
 use wasm_bindgen::JsCast;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Tool {
+pub enum Tool {
     Brush,
     Eraser,
     Line,
     Rectangle,
     Circle,
-    Fill,
 }
 
 pub struct Paint {
@@ -372,7 +371,6 @@ impl std::fmt::Debug for Tool {
             Tool::Line => write!(f, "Line"),
             Tool::Rectangle => write!(f, "Rectangle"),
             Tool::Circle => write!(f, "Circle"),
-            Tool::Fill => write!(f, "Fill"),
         }
     }
 }

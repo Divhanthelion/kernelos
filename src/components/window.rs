@@ -239,7 +239,9 @@ impl Component for Window {
             WindowMsg::PluginEvent(event) => {
                 let handle = ctx.props().window.borrow().plugin_handle.clone();
                 if let Some(handle) = handle {
-                    handle.borrow_mut().send(&event);
+                    if let Err(e) = handle.borrow_mut().send(&event) {
+                        log::warn!("plugin event dispatch failed: {e}");
+                    }
                 }
                 // Re-render either way: the guest may have mutated state (or
                 // crashed, which switches the view to the crash screen).

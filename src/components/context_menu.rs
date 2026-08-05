@@ -167,7 +167,7 @@ impl Component for ContextMenu {
 }
 
 impl ContextMenu {
-    fn render_items(&self, ctx: &Context<Self>, items: &[ContextMenuItem], is_submenu: bool) -> Html {
+    fn render_items(&self, ctx: &Context<Self>, items: &[ContextMenuItem], _is_submenu: bool) -> Html {
         html! {
             <>
                 {

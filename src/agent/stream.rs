@@ -91,7 +91,83 @@ impl Default for SseParser {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<AssistantToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_tools(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<AssistantToolCall>,
+    ) -> Self {
+        Self {
+            role: "assistant".into(),
+            content,
+            reasoning_content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: AssistantFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Nested thinking control. DeepSeek v4 defaults to thinking enabled; sampling
+/// params are silently ignored while thinking is on.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl ThinkingConfig {
+    pub fn enabled() -> Self {
+        Self {
+            type_: "enabled".into(),
+            reasoning_effort: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +176,10 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
     pub stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,23 +187,43 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// Current DeepSeek chat model. Docs list only `deepseek-v4-flash` and
+/// `deepseek-v4-pro`; the legacy `deepseek-chat` id is retired.
+pub const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
+
 impl ChatRequest {
     pub fn streaming(user_content: &str) -> Self {
         Self {
-            model: "deepseek-chat".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: user_content.into(),
-            }],
+            model: DEEPSEEK_MODEL.into(),
+            messages: vec![ChatMessage::user(user_content)],
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            thinking: Some(ThinkingConfig::enabled()),
+            tools: None,
+        }
+    }
+
+    /// Streaming request with VFS tools. Uses the `/beta` base so `strict: true`
+    /// tool schemas are honoured.
+    pub fn streaming_with_tools(user_content: &str, tools: Vec<serde_json::Value>) -> Self {
+        let mut req = Self::streaming(user_content);
+        req.tools = Some(tools);
+        req
+    }
+
+    pub fn api_url(&self) -> &'static str {
+        if self.tools.is_some() {
+            DEEPSEEK_BETA_API_URL
+        } else {
+            DEEPSEEK_API_URL
         }
     }
 }
 
 pub const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
+pub const DEEPSEEK_BETA_API_URL: &str = "https://api.deepseek.com/beta/chat/completions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
@@ -185,7 +285,7 @@ pub async fn stream_completion(
     init.set_signal(Some(&abort.signal()));
 
     let window = web_sys::window().ok_or_else(|| StreamError::Network("no window".into()))?;
-    let req = Request::new_with_str_and_init(DEEPSEEK_API_URL, &init)
+    let req = Request::new_with_str_and_init(request.api_url(), &init)
         .map_err(|e| StreamError::Network(format!("{e:?}")))?;
 
     let resp_val = JsFuture::from(window.fetch_with_request(&req))
