@@ -76,11 +76,44 @@ PY
     fi
 
     echo "==> building $plugin_id"
-    plugin_rustflags="${RUSTFLAGS:-}"
+    # Build a wasm-only RUSTFLAGS for this invocation. Do not inherit a shell
+    # RUSTFLAGS that already contains `-C link-arg=--max-memory=…` — that flag
+    # is meaningless (and fatal) for host `cc` links if it leaks into the
+    # surrounding environment. Callers can set PLUGIN_RUSTFLAGS for extras.
+    plugin_rustflags="${PLUGIN_RUSTFLAGS:-}"
     if [[ -n "$plugin_rustflags" ]]; then
         plugin_rustflags="$plugin_rustflags "
     fi
+    # Hard memory ceiling for the guest linear memory.
     plugin_rustflags="${plugin_rustflags}-C link-arg=--max-memory=$MAX_BYTES"
+    # Drop DWARF and remap every absolute prefix we know about so `file!()` /
+    # panic locations (and thus wasm bytes + wasm_hash) do not depend on
+    # $HOME, the checkout path, the cargo registry hash directory, or the
+    # rustc sysroot. Without this, every machine (and often every build) gets
+    # a different content hash and pinning is meaningless.
+    plugin_rustflags="${plugin_rustflags} -C debuginfo=0"
+    plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${ROOT}="
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    if [[ -d "$cargo_home/registry/src" ]]; then
+        for src_dir in "$cargo_home"/registry/src/*; do
+            [[ -d "$src_dir" ]] || continue
+            plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${src_dir}=/cargo-registry"
+        done
+    fi
+    if [[ -d "$cargo_home/git/checkouts" ]]; then
+        for src_dir in "$cargo_home"/git/checkouts/*/*; do
+            [[ -d "$src_dir" ]] || continue
+            plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${src_dir}=/cargo-git"
+        done
+    fi
+    sysroot="$(rustc --print sysroot)"
+    plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${sysroot}=/rustc"
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${CARGO_TARGET_DIR}=/target"
+    fi
+    # Prefer repo remap over $HOME so checkout paths collapse cleanly.
+    plugin_rustflags="${plugin_rustflags} --remap-path-prefix=${HOME}="
+
     RUSTFLAGS="$plugin_rustflags" cargo build \
         --manifest-path "$plugin_dir/Cargo.toml" \
         --target "$TARGET" \

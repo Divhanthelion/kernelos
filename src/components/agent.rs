@@ -122,6 +122,22 @@ impl Component for Agent {
                 let journal = Rc::clone(&self.journal);
 
                 wasm_bindgen_futures::spawn_local(async move {
+                    // Optional runtimes — never abort the agent loop if a 5–20MB
+                    // asset fails to load. Tools degrade to clean "not loaded"
+                    // errors; surface a cheap status note when useful.
+                    let mut load_notes: Vec<String> = Vec::new();
+                    if let Err(e) = crate::agent::ensure_typescript_loaded().await {
+                        load_notes.push(format!("TypeScript unavailable: {e}"));
+                    }
+                    if let Err(e) = crate::agent::ensure_python_loaded().await {
+                        load_notes.push(format!("Python unavailable: {e}"));
+                    }
+                    let load_note = if load_notes.is_empty() {
+                        None
+                    } else {
+                        Some(load_notes.join(" · "))
+                    };
+
                     let tools = tool_definitions();
                     let mut request = ChatRequest::streaming_with_tools(&prompt, tools);
                     let config = LoopConfig::default();
@@ -191,6 +207,11 @@ impl Component for Agent {
                         }
                         Err(StreamError::Aborted) => (Ok(()), Some("Stopped by user".into())),
                         Err(e) => (Err(e), None),
+                    };
+                    let status = match (status, load_note) {
+                        (Some(s), Some(w)) => Some(format!("{s} · {w}")),
+                        (None, Some(w)) => Some(w),
+                        (s, None) => s,
                     };
                     link.send_message(AgentMsg::StreamEnd { result, status });
                 });
@@ -371,14 +392,16 @@ impl Component for Agent {
                         >
                             { "Stop" }
                         </button>
-                        <button
-                            class="agent-btn agent-btn-undo"
-                            onclick={on_undo}
-                            disabled={self.streaming || !self.undo_available}
-                            title="Revert every file this run touched"
-                        >
-                            { "Undo agent run" }
-                        </button>
+                        if self.undo_available {
+                            <button
+                                class="agent-btn agent-btn-undo"
+                                onclick={on_undo}
+                                disabled={self.streaming}
+                                title="Revert every file this run touched"
+                            >
+                                { "Undo agent run" }
+                            </button>
+                        }
                     </div>
                 </div>
 

@@ -192,20 +192,37 @@ fn read_header_payload(hdr: u32) -> Option<String> {
 // ── Export macro ─────────────────────────────────────────────────────────────
 
 /// Generates the WASM exports required by the KernelOS host ABI.
+///
+/// Instance and render-header state live in `UnsafeCell` (same pattern as the
+/// PDK arena) rather than `static mut`, so the `static_mut_refs` lint is
+/// honest under `-Dwarnings` rather than silent through macro expansion.
 #[macro_export]
 macro_rules! kernelos_plugin {
     ($plugin_ty:ty) => {
-        static mut INSTANCE: Option<$plugin_ty> = None;
-        static mut RENDER_HDR: [i32; 2] = [0, 0];
+        struct __KernelOsPluginState {
+            instance: ::core::cell::UnsafeCell<::core::option::Option<$plugin_ty>>,
+            render_hdr: ::core::cell::UnsafeCell<[i32; 2]>,
+        }
+
+        // Guest plugins are single-threaded wasm32; the host never shares this
+        // state across threads. `Sync` is required only so a `static` is legal.
+        unsafe impl Sync for __KernelOsPluginState {}
+
+        static __KERNELOS_PLUGIN_STATE: __KernelOsPluginState = __KernelOsPluginState {
+            instance: ::core::cell::UnsafeCell::new(::core::option::Option::None),
+            render_hdr: ::core::cell::UnsafeCell::new([0, 0]),
+        };
 
         fn plugin_instance() -> &'static mut $plugin_ty {
+            // SAFETY: single-threaded wasm guest; no concurrent access.
             unsafe {
-                if INSTANCE.is_none() {
+                let slot = &mut *__KERNELOS_PLUGIN_STATE.instance.get();
+                if slot.is_none() {
                     let mut p = <$plugin_ty as ::core::default::Default>::default();
                     p.init();
-                    INSTANCE = Some(p);
+                    *slot = ::core::option::Option::Some(p);
                 }
-                INSTANCE.as_mut().unwrap()
+                slot.as_mut().unwrap()
             }
         }
 
@@ -250,11 +267,14 @@ macro_rules! kernelos_plugin {
                 Err(_) => return 0,
             };
             let out_ptr = ::kernelos_pdk::arena_alloc(json.len());
+            // SAFETY: single-threaded wasm guest; header is only read by the
+            // host after this call returns.
             unsafe {
                 std::ptr::copy_nonoverlapping(json.as_ptr(), out_ptr, json.len());
-                RENDER_HDR[0] = out_ptr as i32;
-                RENDER_HDR[1] = json.len() as i32;
-                RENDER_HDR.as_ptr() as i32
+                let hdr = &mut *__KERNELOS_PLUGIN_STATE.render_hdr.get();
+                hdr[0] = out_ptr as i32;
+                hdr[1] = json.len() as i32;
+                hdr.as_ptr() as i32
             }
         }
     };

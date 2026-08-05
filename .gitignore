@@ -34,9 +34,11 @@ credentials.json
 *.keystore
 *.jks
 
-# === Markdown (except README) ===
+# === Markdown (except product docs + README) ===
 *.md
 !README.md
+!PLAN.md
+!HANDOFF.md
 
 # === Text files (except requirements) ===
 *.txt
@@ -46,4 +48,14 @@ credentials.json
 # === Rust ===
 target/
 **/*.rs.bk
+
+# === Regenerable / vendored runtimes (PLAN M5) ===
+# TypeScript libs+min are committed under assets/ts/; trunk copies to dist/ts/.
+dist/ts/
+# Pyodide is fetched by ./fetch-pyodide.sh — not committed.
+assets/py/pyodide/
+dist/py/
+
+# Divergence experiment transcripts (may contain model output; never keys)
+scripts/divergence-out/
 

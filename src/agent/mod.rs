@@ -1,15 +1,18 @@
 //! In-tab AI agent: streaming transport (M1), VFS tools (M2), multi-turn loop (M3),
-//! copy-on-write journal / undo (M4).
+//! copy-on-write journal / undo (M4), TypeScript typecheck (M5a), Python (M5b).
 
 pub mod accum;
 pub mod journal;
+pub mod python;
 pub mod roundtrip;
 pub mod salvage;
 pub mod stream;
 pub mod tools;
+pub mod typecheck;
 
 pub use accum::{ToolCallAccum, TurnAccumulator, UsageAccum};
 pub use journal::{FileDelta, Journal, PathState, RECURSIVE_DELETE_GATE_THRESHOLD};
+pub use python::ensure_python_loaded;
 pub use roundtrip::{
     run_agent_loop, tool_round_trip, LoopConfig, LoopEvent, LoopOutcome, LoopStopReason,
     TranscriptTurn, ToolInvocation, DEFAULT_MAX_ITERATIONS, REPETITION_LIMIT,
@@ -23,6 +26,7 @@ pub use stream::{
 pub use tools::{
     execute_tool, tool_definitions, truncate_result, MAX_TOOL_RESULT_BYTES, TOOL_NAMES,
 };
+pub use typecheck::ensure_typescript_loaded;
 
 /// localStorage key for the DeepSeek API key. Deliberately outside the VFS —
 /// no `kernelosv2_file:` prefix, no FileSystem path.

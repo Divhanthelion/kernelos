@@ -81,6 +81,12 @@
     </div>
     <!-- Plugin bundles, served at /plugins/ so `pkg install <id>` can fetch them. -->
     <link data-trunk rel="copy-dir" href="assets/plugins" />
+    <!-- TypeScript compiler + lib .d.ts for the agent typecheck tool (PLAN M5a). -->
+    <link data-trunk rel="copy-dir" href="assets/ts" />
+    <script src="/ts/typecheck.js"></script>
+    <!-- Python bridge; Pyodide runtime under /py/pyodide/ via ./fetch-pyodide.sh (M5b). -->
+    <link data-trunk rel="copy-dir" href="assets/py" />
+    <script src="/py/python.js"></script>
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
     <script>
         // Hide loading screen once WASM is ready

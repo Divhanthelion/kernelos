@@ -1,7 +1,7 @@
-//! VFS tools for the agent (PLAN M2).
+//! VFS tools for the agent (PLAN M2), TypeScript typecheck (M5a), Python (M5b).
 //!
-//! Six tools, mapped 1:1 onto `FileSystem` methods. Keep the set small — the
-//! primary mitigation for plain-text tool-call leakage.
+//! Eight tools is the ceiling (PLAN §2 plain-text leak risk). New tools append
+//! only — never reorder — so DeepSeek's prefix cache stays warm.
 
 use std::collections::BTreeMap;
 
@@ -10,12 +10,19 @@ use serde_json::{json, Value};
 use crate::agent::journal::{
     confirm_gate, is_protected_path, Journal, RECURSIVE_DELETE_GATE_THRESHOLD,
 };
+use crate::agent::python::{collect_python_inputs, run_python_files};
+use crate::agent::typecheck::{collect_typecheck_inputs, typecheck_files};
 use crate::filesystem::FileSystem;
 
 /// Soft cap on tool-result content returned to the model.
 pub const MAX_TOOL_RESULT_BYTES: usize = 8_192;
 
-/// The six VFS tool names. Keep in sync with `tool_definitions`.
+/// Hard ceiling on tool count — PLAN §2 correlates leaks with 40+ definitions;
+/// we stay at the ~6–8 band. Append only; never insert.
+pub const MAX_TOOLS: usize = 8;
+
+/// The eight tool names. Keep in sync with `tool_definitions`.
+/// `run_python` must remain last — prefix-cache stability.
 pub const TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
@@ -23,6 +30,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "create_directory",
     "delete",
     "rename",
+    "typecheck",
+    "run_python",
 ];
 
 const TRUNCATION_MARKER_PREFIX: &str = "\n\n[truncated, ";
@@ -87,6 +96,32 @@ pub fn tool_definitions() -> Vec<Value> {
                 ("new_path", prop_string("Destination absolute path.")),
             ]),
             &["old_path", "new_path"],
+        ),
+        // Appended after the six VFS tools — do not reorder.
+        tool_def(
+            "typecheck",
+            "Run the TypeScript compiler over a .ts/.tsx file or a directory of \
+             them in the VFS. Returns diagnostics (or 'no errors'). Read-only.",
+            props(&[(
+                "path",
+                prop_string(
+                    "Absolute VFS path to a .ts/.tsx file, or a directory to \
+                     typecheck recursively.",
+                ),
+            )]),
+            &["path"],
+        ),
+        // Appended last — do not reorder; DeepSeek prefix caching depends on it.
+        tool_def(
+            "run_python",
+            "Execute a Python (.py) file from the VFS with the in-browser CPython \
+             (Pyodide). Returns stdout, stderr, and tracebacks. Stdlib only; \
+             read-only with respect to the VFS. Warning: infinite loops hang the tab.",
+            props(&[(
+                "path",
+                prop_string("Absolute VFS path to a .py file to execute."),
+            )]),
+            &["path"],
         ),
     ]
 }
@@ -174,6 +209,8 @@ pub fn execute_tool(
         "create_directory" => exec_create_directory(fs, &args, journal),
         "delete" => exec_delete(fs, &args, journal),
         "rename" => exec_rename(fs, &args, journal),
+        "typecheck" => exec_typecheck(fs, &args),
+        "run_python" => exec_run_python(fs, &args),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -344,6 +381,24 @@ fn exec_rename(
     Ok(format!("renamed {old_path} → {new_path}"))
 }
 
+/// Read-only — must not touch the journal.
+fn exec_typecheck(fs: &FileSystem, args: &Value) -> Result<String, String> {
+    let path = require_str(args, "path")?;
+    let (roots, files) = collect_typecheck_inputs(fs, path)?;
+    if roots.is_empty() {
+        return Ok(format!("no TypeScript files found under {path}"));
+    }
+    typecheck_files(&files, &roots)
+}
+
+/// Read-only with respect to the VFS — takes `&FileSystem`, no journal.
+/// Python-side writes do not land in the KernelOS VFS (M5b scope).
+fn exec_run_python(fs: &FileSystem, args: &Value) -> Result<String, String> {
+    let path = require_str(args, "path")?;
+    let (entry, files) = collect_python_inputs(fs, path)?;
+    run_python_files(&files, &entry)
+}
+
 /// Truncate oversized tool results with an explicit marker.
 pub fn truncate_result(s: String) -> String {
     if s.len() <= MAX_TOOL_RESULT_BYTES {
@@ -386,7 +441,20 @@ mod tests {
     #[test]
     fn tool_schemas_have_strict_mode_and_no_additional_properties() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
+        assert_eq!(TOOL_NAMES.len(), 8);
+        assert!(
+            TOOL_NAMES.len() <= MAX_TOOLS,
+            "tool count {} exceeds ceiling {MAX_TOOLS} — PLAN §2 leak risk",
+            TOOL_NAMES.len()
+        );
+        assert_eq!(TOOL_NAMES.last(), Some(&"run_python"));
+        assert_eq!(
+            tools.last().and_then(|t| t["function"]["name"].as_str()),
+            Some("run_python"),
+            "run_python must be last for prefix-cache stability"
+        );
+        assert_eq!(TOOL_NAMES[TOOL_NAMES.len() - 2], "typecheck");
         for tool in &tools {
             let func = &tool["function"];
             assert_eq!(func["strict"], true);
@@ -481,6 +549,118 @@ mod tests {
         let mut fs = FileSystem::default();
         let out = execute_tool(&mut fs, "not_a_tool", r#"{}"#, None);
         assert_eq!(out, "error: unknown tool: not_a_tool");
+    }
+
+    #[test]
+    fn typecheck_is_dispatched_not_unknown() {
+        let mut fs = FileSystem::default();
+        let _ = fs.write_file("/home/documents/x.ts", "const n: number = 1;\n");
+        let out = execute_tool(
+            &mut fs,
+            "typecheck",
+            r#"{"path":"/home/documents/x.ts"}"#,
+            None,
+        );
+        // Host stub — never "unknown tool".
+        assert!(
+            !out.contains("unknown tool"),
+            "typecheck must be dispatched, got {out}"
+        );
+        assert!(
+            out.contains("typecheck unavailable outside the browser")
+                || out.contains("no errors")
+                || out.contains("error TS"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn typecheck_leaves_journal_empty() {
+        let mut fs = FileSystem::default();
+        let mut journal = Journal::new();
+        let _ = fs.write_file("/home/documents/j.ts", "const n: number = 1;\n");
+        let _ = execute_tool(
+            &mut fs,
+            "typecheck",
+            r#"{"path":"/home/documents/j.ts"}"#,
+            Some(&mut journal),
+        );
+        assert!(
+            journal.is_empty(),
+            "typecheck must not touch the journal (undo safety)"
+        );
+    }
+
+    #[test]
+    fn typecheck_host_stub_returns_unavailable_error() {
+        let mut fs = FileSystem::default();
+        let _ = fs.write_file("/home/documents/stub.ts", "export {}\n");
+        let out = execute_tool(
+            &mut fs,
+            "typecheck",
+            r#"{"path":"/home/documents/stub.ts"}"#,
+            None,
+        );
+        assert!(
+            out.starts_with("error: typecheck unavailable outside the browser"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn typecheck_empty_directory_reports_no_files_found() {
+        let mut fs = FileSystem::default();
+        fs.create_directory("/home/projects/emptyts", true).unwrap();
+        fs.write_file("/home/projects/emptyts/note.txt", "x\n")
+            .unwrap();
+        let out = execute_tool(
+            &mut fs,
+            "typecheck",
+            r#"{"path":"/home/projects/emptyts"}"#,
+            None,
+        );
+        assert!(
+            out.contains("no TypeScript files found under /home/projects/emptyts"),
+            "{out}"
+        );
+        assert!(!out.contains("no errors"), "{out}");
+    }
+
+    #[test]
+    fn typecheck_includes_dts_in_collected_files() {
+        let mut fs = FileSystem::default();
+        fs.create_directory("/home/projects/dts", true).unwrap();
+        fs.write_file(
+            "/home/projects/dts/types.d.ts",
+            "declare const MAGIC: number;\n",
+        )
+        .unwrap();
+        fs.write_file("/home/projects/dts/main.ts", "const n: number = MAGIC;\n")
+            .unwrap();
+        let (roots, files) =
+            collect_typecheck_inputs(&fs, "/home/projects/dts").unwrap();
+        assert_eq!(roots, vec!["/home/projects/dts/main.ts".to_string()]);
+        assert!(files.contains_key("/home/projects/dts/types.d.ts"));
+    }
+
+    #[test]
+    fn run_python_is_dispatched_and_leaves_journal_empty() {
+        let mut fs = FileSystem::default();
+        let mut journal = Journal::new();
+        fs.write_file("/home/documents/hi.py", "print('hi')\n")
+            .unwrap();
+        let out = execute_tool(
+            &mut fs,
+            "run_python",
+            r#"{"path":"/home/documents/hi.py"}"#,
+            Some(&mut journal),
+        );
+        assert!(!out.contains("unknown tool"), "{out}");
+        assert!(journal.is_empty(), "run_python must not touch the journal");
+        assert!(
+            out.starts_with("error: python unavailable outside the browser"),
+            "{out}"
+        );
     }
 
     #[test]

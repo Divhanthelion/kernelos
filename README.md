@@ -93,6 +93,9 @@ rustup target add wasm32-unknown-unknown
 # Build and stage every plugin with its 16 MiB hard memory cap
 ./build-plugins.sh
 
+# Fetch the pinned Pyodide runtime (needed for the agent's run_python tool)
+./fetch-pyodide.sh
+
 # Run development server
 trunk serve
 
