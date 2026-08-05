@@ -60,6 +60,9 @@ gloo-timers = "0.4"
 rand = "0.10"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
+[dev-dependencies]
+pollster = "0.4"
+
 [profile.release]
 opt-level = "s"
 lto = true

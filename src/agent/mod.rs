@@ -1,18 +1,25 @@
-//! In-tab AI agent streaming transport (M1) and VFS tools (M2).
+//! In-tab AI agent: streaming transport (M1), VFS tools (M2), multi-turn loop (M3).
 
 pub mod accum;
 pub mod roundtrip;
+pub mod salvage;
 pub mod stream;
 pub mod tools;
 
-pub use accum::{ToolCallAccum, TurnAccumulator};
-pub use roundtrip::tool_round_trip;
+pub use accum::{ToolCallAccum, TurnAccumulator, UsageAccum};
+pub use roundtrip::{
+    run_agent_loop, tool_round_trip, LoopConfig, LoopEvent, LoopOutcome, LoopStopReason,
+    TranscriptTurn, ToolInvocation, DEFAULT_MAX_ITERATIONS, REPETITION_LIMIT,
+};
+pub use salvage::salvage_tool_calls;
 pub use stream::{
     stream_completion, AssistantFunctionCall, AssistantToolCall, ChatMessage, ChatRequest,
     SseEvent, SseParser, StreamError, ThinkingConfig, DEEPSEEK_API_URL, DEEPSEEK_BETA_API_URL,
     DEEPSEEK_MODEL,
 };
-pub use tools::{execute_tool, tool_definitions, truncate_result, MAX_TOOL_RESULT_BYTES};
+pub use tools::{
+    execute_tool, tool_definitions, truncate_result, MAX_TOOL_RESULT_BYTES, TOOL_NAMES,
+};
 
 /// localStorage key for the DeepSeek API key. Deliberately outside the VFS —
 /// no `kernelosv2_file:` prefix, no FileSystem path.

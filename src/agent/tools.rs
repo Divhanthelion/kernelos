@@ -12,6 +12,16 @@ use crate::filesystem::FileSystem;
 /// Soft cap on tool-result content returned to the model.
 pub const MAX_TOOL_RESULT_BYTES: usize = 8_192;
 
+/// The six VFS tool names. Keep in sync with `tool_definitions`.
+pub const TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "list_directory",
+    "create_directory",
+    "delete",
+    "rename",
+];
+
 const TRUNCATION_MARKER_PREFIX: &str = "\n\n[truncated, ";
 const TRUNCATION_MARKER_SUFFIX: &str = " bytes omitted]";
 
@@ -20,8 +30,7 @@ const TRUNCATION_MARKER_SUFFIX: &str = " bytes omitted]";
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool_def(
-            "read_file",
-            "Read the contents of a file at the given absolute VFS path.",
+            "read_file",            "Read the contents of a file at the given absolute VFS path.",
             props(&[("path", prop_string("Absolute path to the file to read."))]),
             &["path"],
         ),

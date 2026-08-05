@@ -9,17 +9,68 @@ pub struct ToolCallAccum {
     pub arguments: String,
 }
 
+/// Token / cache usage from `stream_options.include_usage` chunks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageAccum {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub prompt_cache_hit_tokens: u64,
+    pub prompt_cache_miss_tokens: u64,
+}
+
+impl UsageAccum {
+    pub fn add_from_chunk(&mut self, chunk: &Value) {
+        let Some(usage) = chunk.get("usage") else {
+            return;
+        };
+        // Within a single turn, later chunks overwrite (DeepSeek sends one
+        // definitive usage object on the trailing chunk). Across loop
+        // iterations, callers sum via `absorb`.
+        if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            self.prompt_tokens = v;
+        }
+        if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            self.completion_tokens = v;
+        }
+        if let Some(v) = usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()) {
+            self.prompt_cache_hit_tokens = v;
+        }
+        if let Some(v) = usage.get("prompt_cache_miss_tokens").and_then(|v| v.as_u64()) {
+            self.prompt_cache_miss_tokens = v;
+        }
+    }
+
+    pub fn absorb(&mut self, other: &UsageAccum) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.prompt_cache_hit_tokens += other.prompt_cache_hit_tokens;
+        self.prompt_cache_miss_tokens += other.prompt_cache_miss_tokens;
+    }
+
+    pub fn cache_hit_rate(&self) -> f64 {
+        let total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens;
+        if total == 0 {
+            0.0
+        } else {
+            self.prompt_cache_hit_tokens as f64 / total as f64
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnAccumulator {
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCallAccum>,
     pub finish_reason: Option<String>,
+    pub usage: UsageAccum,
 }
 
 impl TurnAccumulator {
     /// Apply one `chat.completion.chunk` JSON object.
     pub fn apply_chunk(&mut self, chunk: &Value) {
+        self.usage.add_from_chunk(chunk);
+
         let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) else {
             return;
         };
@@ -120,12 +171,21 @@ mod tests {
         let mut accum = TurnAccumulator::default();
         accum.apply_chunk(&json!({
             "choices": [],
-            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "prompt_cache_hit_tokens": 8,
+                "prompt_cache_miss_tokens": 2
+            }
         }));
         assert!(accum.content.is_empty());
         assert!(accum.reasoning.is_empty());
         assert!(accum.tool_calls.is_empty());
         assert!(accum.finish_reason.is_none());
+        assert_eq!(accum.usage.prompt_tokens, 10);
+        assert_eq!(accum.usage.completion_tokens, 5);
+        assert_eq!(accum.usage.prompt_cache_hit_tokens, 8);
+        assert_eq!(accum.usage.prompt_cache_miss_tokens, 2);
     }
 
     #[test]
@@ -138,5 +198,26 @@ mod tests {
             "choices": [{ "delta": { "reasoning_content": "more" } }]
         }));
         assert_eq!(accum.reasoning, "think more");
+    }
+
+    #[test]
+    fn usage_absorbs_across_iterations() {
+        let mut total = UsageAccum::default();
+        total.absorb(&UsageAccum {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            prompt_cache_hit_tokens: 80,
+            prompt_cache_miss_tokens: 20,
+        });
+        total.absorb(&UsageAccum {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            prompt_cache_hit_tokens: 40,
+            prompt_cache_miss_tokens: 10,
+        });
+        assert_eq!(total.prompt_cache_hit_tokens, 120);
+        assert_eq!(total.prompt_cache_miss_tokens, 30);
+        assert_eq!(total.completion_tokens, 30);
+        assert!((total.cache_hit_rate() - 0.8).abs() < f64::EPSILON);
     }
 }
