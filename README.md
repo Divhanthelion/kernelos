@@ -81,8 +81,8 @@ cat /system/config/session.json
 ### Build & Run
 
 ```bash
-# Clone or download the project
-cd kernelosv2
+git clone https://github.com/Divhanthelion/kernelos.git
+cd kernelos
 
 # Install trunk if you haven't
 cargo install trunk
@@ -221,4 +221,8 @@ window geometry, the wallpaper gradient, colour swatches, editor font size.
 
 ---
 
-Built with ❤️ using Rust and WebAssembly
+Built with Rust and WebAssembly.
+
+## License
+
+MIT

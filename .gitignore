@@ -59,3 +59,13 @@ dist/py/
 # Divergence experiment transcripts (may contain model output; never keys)
 scripts/divergence-out/
 
+
+# GH_Audit hygiene
+.DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+target/
+dist/
